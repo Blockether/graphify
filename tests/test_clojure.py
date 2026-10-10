@@ -439,3 +439,50 @@ def test_incremental_rebuild_resolves_into_unchanged_files(tmp_path):
     assert {"slug()", "with-thing (macro)", "make-model()"} <= calls
     imports = {by_id.get(e["target"]) for e in r["edges"] if e["relation"] == "imports"}
     assert {"app.util", "app.model"} <= imports
+
+
+def test_shared_imports_resolve_to_one_node(tmp_path):
+    # Two files that require the same namespace once got one stub each (the
+    # colliding-id pass salted the shared stub id per file), so `imports` never
+    # reached the real namespace node and an external lib split into N nodes.
+    files = {
+        "src/app/a.clj": "(ns app.a)\n(defn f [] 1)\n",
+        "src/app/b.clj": "(ns app.b (:require [app.a :as a] [clojure.string :as str]))\n(defn g [] (a/f))\n",
+        "src/app/c.clj": "(ns app.c (:require [app.a :as a] [clojure.string :as str]))\n(defn h [] (a/f))\n",
+    }
+    paths = [_write(tmp_path, name, body) for name, body in files.items()]
+    r = extract(paths, cache_root=tmp_path, parallel=False)
+    by_id = {n["id"]: n for n in r["nodes"]}
+    ns_a = {nid for nid, n in by_id.items() if (n.get("metadata") or {}).get("kind") == "namespace"
+            and n["label"] == "app.a"}
+    targets = {}
+    for e in r["edges"]:
+        if e["relation"] == "imports":
+            targets.setdefault(by_id[e["target"]]["label"], set()).add(e["target"])
+    assert targets["app.a"] == ns_a
+    assert len(targets["clojure.string"]) == 1
+
+
+def test_redefs_var_quote_heads_and_resolve_reference_vars(tmp_path):
+    # Binding targets of with-redefs/binding are existing vars, not new locals;
+    # a non-symbol call head (#'ns/f, (comp ...)) must still be walked; and
+    # (requiring-resolve 'ns/f) names a var. All three were dropped before.
+    files = {
+        "src/app/a.clj": "(ns app.a)\n(def ^:dynamic *cfg* nil)\n(defn f [] 1)\n(defn- p [] 2)\n"
+                         "(defn q [] 3)\n(defn r [] 4)\n(defn s [] 5)\n",
+        "src/app/t.clj": "(ns app.t (:require [app.a :as a]))\n"
+                         "(defn t1 [] (with-redefs [a/f (constantly 9)] (a/q)))\n"
+                         "(defn t2 [] (binding [a/*cfg* {}] 1))\n"
+                         "(defn t3 [] (#'a/p))\n"
+                         "(defn t4 [] ((requiring-resolve 'app.a/r)))\n"
+                         "(defn t5 [] ((comp a/s identity) 1))\n"
+                         "(defn t6 [f] (with-redefs [] (f)))\n",
+    }
+    paths = [_write(tmp_path, name, body) for name, body in files.items()]
+    r = extract(paths, cache_root=tmp_path, parallel=False)
+    assert "f()" in _targets(r, "t1()", "references")
+    assert "q()" in _targets(r, "t1()", "calls")
+    assert "*cfg*" in _targets(r, "t2()", "references")
+    assert "p()" in _targets(r, "t3()", "calls")
+    assert "r()" in _targets(r, "t4()", "references")
+    assert "s()" in _targets(r, "t5()", "references")

@@ -23,9 +23,13 @@ from graphify.extractors.base import _file_stem, _make_id, _read_source_bytes
 # Forms that bind names in a leading binding vector: [name init name init ...]
 _LET_FORMS = frozenset({
     "let", "let*", "loop", "loop*", "when-let", "if-let", "when-some", "if-some",
-    "when-first", "binding", "with-open", "with-local-vars", "with-redefs",
+    "when-first", "with-open", "with-local-vars",
     "for", "doseq", "dotimes", "with-out-str", "plet", "go-loop",
 })
+# Forms whose binding vector names EXISTING vars: [var value var value ...]
+_REDEF_FORMS = frozenset({"binding", "with-redefs"})
+# Forms that take a quoted symbol naming a var: (requiring-resolve 'my.ns/f)
+_RESOLVE_FORMS = frozenset({"requiring-resolve", "resolve", "ns-resolve", "find-var"})
 _FN_FORMS = frozenset({"fn", "fn*", "bound-fn"})
 # Map destructuring keys whose value is a vector of names to bind. The `!` forms
 # are the Clojure 1.13 required-key directives.
@@ -145,12 +149,17 @@ def extract_clojure(path: Path) -> dict:
         })
 
     def add_stub(nid: str, label: str) -> str:
+        # Every stub is an import anchor (a namespace, Java class or library).
+        # `type: module` makes the colliding-id pass merge the copies that
+        # several files emit into one shared node (#1327), so the resolver can
+        # point `imports` at the real namespace node.
         if nid not in seen_ids:
             seen_ids.add(nid)
             nodes.append({
                 "id": nid,
                 "label": label,
                 "file_type": "code",
+                "type": "module",
                 "source_file": "",
                 "source_location": "",
                 "origin_file": str_path,
@@ -345,8 +354,35 @@ def extract_clojure(path: Path) -> dict:
                     for v in vals[2:]:
                         _walk_refs(v, owner, inner)
                     return
+                if hname in _REDEF_FORMS and hname not in shadow and len(vals) > 1 \
+                        and vals[1].type == "vec_lit":
+                    for k, item in enumerate(_values(vals[1])):
+                        target = _sym(item) if k % 2 == 0 and item.type == "sym_lit" else None
+                        if target:
+                            _resolve_ref(owner, target, "references", _line(item), shadow)
+                        else:
+                            _walk_refs(item, owner, shadow)
+                    for v in vals[2:]:
+                        _walk_refs(v, owner, shadow)
+                    return
+                if hname in _RESOLVE_FORMS and hname not in shadow:
+                    for v in vals[1:]:
+                        quoted = _values(v) if v.type == "quoting_lit" else []
+                        named = _sym(quoted[0]) if quoted and quoted[0].type == "sym_lit" else None
+                        if named:
+                            # A quoted symbol ignores locals, so no shadowing applies.
+                            _resolve_ref(owner, named, "references", _line(quoted[0]), frozenset())
             if head:
                 _resolve_ref(owner, head, "calls", _line(vals[0]), shadow)
+            elif vals[0].type == "var_quoting_lit":
+                # (#'my.ns/f x) calls the var directly.
+                for v in _values(vals[0]):
+                    called = _sym(v) if v.type == "sym_lit" else None
+                    if called:
+                        _resolve_ref(owner, called, "calls", _line(v), shadow)
+            else:
+                # A computed head such as ((comp f g) x) still references code.
+                _walk_refs(vals[0], owner, shadow)
             for v in vals[1:]:
                 _walk_refs(v, owner, shadow)
             return
