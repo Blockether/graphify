@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "graphifyy"
-version = "0.9.93"
+version = "0.9.93+blockether.1"
 description = "AI coding assistant skill (Claude Code, CodeBuddy, Codex, OpenCode, Kilo Code, Cursor, Gemini CLI, Aider, OpenClaw, Factory Droid, Trae, Hermes, Kiro, Pi, Devin CLI, Google Antigravity) - turn any folder of code, docs, papers, images, or videos into a queryable knowledge graph"
 readme = "README.md"
 license = "Apache-2.0"
@@ -49,6 +49,9 @@ dependencies = [
     "tree-sitter-fortran>=0.6,<0.8",
     "tree-sitter-bash>=0.23,<0.27",
     "tree-sitter-json>=0.23,<0.26",
+    # Clojure/ClojureScript/EDN (Blockether fork). No PyPI wheel exists, so it
+    # builds from the tagged Git source (needs a C compiler, like tree-sitter-dm).
+    "tree-sitter-clojure @ git+https://github.com/Blockether/tree-sitter-clojure@v0.0.13-blockether.7",
 ]
 
 [project.urls]
