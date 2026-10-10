@@ -19,7 +19,7 @@
                    :auth {:role :merchant})
       (edd/reg-event :product-upserted (fn [agg e] (merge agg (:attrs e))))
       (edd/reg-query :get-product get-product
-                     :consumes [:map [:sku :string]]
+                     :consumes [:map [:sku :stirng]]
                      :produces [:maybe s/ProductView])
       (edd/reg-query :list-products list-products
                      :produces [:vector s/ProductView])))

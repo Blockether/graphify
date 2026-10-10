@@ -9,10 +9,13 @@ the form that its ``def`` holds; the converter puts each named schema in
 from __future__ import annotations
 
 import copy
+import re
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from graphify.domain import edn
 from graphify.domain.edn import Form
+from graphify.domain.validate import UNKNOWN, Checker, Keyword
 
 JSON_SCHEMA_DIALECT = "https://json-schema.org/draft/2020-12/schema"
 
@@ -66,6 +69,63 @@ _PREDICATES = {
 }
 
 _SCHEMA_CONSTRUCTORS = {"schema", "-schema", "form", "deref", "into-schema"}
+
+# Vector schemas and the least count of children that Malli accepts for them.
+_MIN_CHILDREN = {
+    "map-of": 2, "vector": 1, "sequential": 1, "set": 1, "every": 1, "seqable": 1, "maybe": 1, "not": 1,
+    "enum": 1, "=": 1, "not=": 1, ">": 1, ">=": 1, "<": 1, "<=": 1, "re": 1, "ref": 1, "multi": 1,
+    "or": 1, "and": 1, "orn": 1, "andn": 1,
+}
+
+# re.error messages that are also errors for java.util.regex. Other messages can
+# come from Java-only syntax, such as \p{L}, so they do not count.
+_REGEX_ERRORS = ("unterminated character set", "missing ), unterminated subpattern", "unbalanced parenthesis",
+                 "nothing to repeat", "multiple repeat", "bad character range")
+
+ERROR, WARNING, INFO = "error", "warning", "info"
+
+
+@dataclass(frozen=True)
+class SchemaIssue:
+    """A problem in a Malli schema, or a place where JSON Schema is only an approximation."""
+
+    severity: str  # error, warning or info
+    code: str  # schema-unknown-type, schema-unresolved, ...
+    message: str
+    line: int | None
+    context: Any = None  # the resolver context (for example the source file) of the form
+
+
+def literal(form: Form | None) -> Any:
+    """Return the value of a literal form for checks, with :data:`UNKNOWN` for code.
+
+    Keywords become :class:`~graphify.domain.validate.Keyword`, so a check can
+    tell ``:a`` from ``"a"``.
+    """
+    if form is None:
+        return UNKNOWN
+    k = form.kind
+    if k == edn.KEYWORD:
+        return Keyword(str(form.value))
+    if k in (edn.STRING, edn.NUMBER, edn.BOOL, edn.NIL):
+        return edn_value(form)
+    if k == edn.TAGGED and form.items and str(form.value).lstrip("#") in ("uuid", "inst"):
+        inner = form.items[0]
+        return inner.value if inner.kind == edn.STRING else UNKNOWN
+    if k in (edn.VECTOR, edn.SET):
+        return [literal(i) for i in form.items]
+    if k == edn.LIST and form.head is not None and form.head.is_sym("quote") and len(form.items) > 1:
+        return literal(form.items[1])
+    if k == edn.QUOTE and form.items:
+        return literal(form.items[0])
+    if k == edn.MAP:
+        out = {}
+        for key, value in form.pairs():
+            if key.kind not in (edn.KEYWORD, edn.STRING):
+                return UNKNOWN
+            out[str(key.value)] = literal(value)
+        return out
+    return UNKNOWN
 
 
 def edn_value(form: Form | None) -> Any:
@@ -131,12 +191,26 @@ def merge_objects(*schemas: dict) -> dict:
 class MalliConverter:
     """Convert Malli forms to JSON Schema and collect named ``$defs``."""
 
-    def __init__(self, resolve: Resolver | None = None, registry: dict[str, tuple[Form, Any]] | None = None):
+    def __init__(self, resolve: Resolver | None = None, registry: dict[str, tuple[Form, Any]] | None = None,
+                 is_local: Callable[[Form, Any], bool] | None = None):
+        """``is_local(symbol, context)`` tells if an unresolved symbol names a var of this
+        corpus (an error) or of a library that the corpus does not contain (a warning)."""
         self.resolve = resolve
+        self.is_local = is_local
         self.registry = dict(registry or {})
         self.defs: dict[str, dict] = {}
-        self.warnings: list[str] = []
+        self.issues: list[SchemaIssue] = []
         self._active: set[str] = set()
+        self._context: Any = None
+        self._line: int | None = None
+
+    def _issue(self, severity: str, code: str, message: str, line: int | None = None) -> None:
+        issue = SchemaIssue(severity, code, message, line or self._line, self._context)
+        if issue not in self.issues:
+            self.issues.append(issue)
+
+    def _approximate(self, message: str, line: int | None = None) -> None:
+        self._issue(INFO, "schema-approximation", message, line)
 
     # -- public ------------------------------------------------------------
     def document(self, form: Form | None, context: Any = None, title: str | None = None) -> dict:
@@ -161,7 +235,7 @@ class MalliConverter:
         try:
             return self._convert(form, context)
         except RecursionError:  # pragma: no cover - deep self-reference
-            self.warnings.append(f"schema too deep: {form.text[:60]}")
+            self._approximate(f"schema too deep: {form.text[:60]}", form.line)
             return {}
 
     # -- internals -----------------------------------------------------------
@@ -204,7 +278,12 @@ class MalliConverter:
             return copy.deepcopy(_SIMPLE[_PREDICATES[bare]])
         resolved = self.resolve(form, context) if self.resolve else None
         if resolved is None:
-            self.warnings.append(f"unresolved schema symbol `{name}` (line {form.line})")
+            if bare.endswith("?"):
+                self._approximate(f"unknown predicate `{name}` allows any value", form.line)
+                return {"$comment": f"Malli predicate {name}"}
+            local = self.is_local(form, context) if self.is_local else False
+            where = "is not defined" if local else "is not in this corpus"
+            self._issue(ERROR if local else WARNING, "schema-unresolved", f"schema `{name}` {where}", form.line)
             return {"$comment": f"unresolved Malli schema `{name}`"}
         qualified, value, value_context = resolved
         return self._named(qualified, value, value_context)
@@ -216,15 +295,18 @@ class MalliConverter:
         if name in self.registry:
             value, value_context = self.registry[name]
             return self._named(name, value, value_context)
-        self.warnings.append(f"unknown Malli type `:{name}` (line {form.line})")
+        if "/" in name:
+            self._issue(WARNING, "schema-unresolved", f"registry schema `:{name}` is not in this corpus", form.line)
+        else:
+            self._issue(ERROR, "schema-unknown-type", f"`:{name}` is not a Malli schema type", form.line)
         return {"$comment": f"unknown Malli type :{name}"}
 
-    @staticmethod
-    def _with_props(schema: dict, type_name: str, props: dict | None) -> dict:
+    def _with_props(self, schema: dict, type_name: str, props: dict | None) -> dict:
         if not props:
             return schema
         t = schema.get("type")
         mn, mx = props.get("min"), props.get("max")
+        mn, mx = self._check_bounds(type_name, t, mn, mx)
         if t == "string":
             if mn is not None:
                 schema["minLength"] = mn
@@ -255,6 +337,44 @@ class MalliConverter:
                 schema[k.split("/", 1)[1]] = v
         return schema
 
+    def _check_bounds(self, type_name: str, json_type: Any, mn: Any, mx: Any) -> tuple[Any, Any]:
+        """Report invalid ``:min`` and ``:max`` values; return the usable ones."""
+        def number(v: Any) -> bool:
+            return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+        for key, value in (("min", mn), ("max", mx)):
+            if value is not None and not number(value):
+                self._issue(ERROR, "schema-invalid-bounds", f"`:{key}` of `:{type_name}` is {value!r}, not a number")
+        mn = mn if number(mn) else None
+        mx = mx if number(mx) else None
+        if mn is not None and mx is not None and mn > mx:
+            self._issue(ERROR, "schema-invalid-bounds",
+                        f"`:{type_name}` has `:min {mn}` greater than `:max {mx}`, so no value is valid")
+        if json_type in ("string", "array", "object"):
+            for key, value in (("min", mn), ("max", mx)):
+                if value is not None and value < 0:
+                    self._issue(ERROR, "schema-invalid-bounds", f"`:{type_name}` has a negative size `:{key} {value}`")
+        return mn, mx
+
+    def _check_default(self, default: Form | None, schema: dict, what: str) -> None:
+        """Report a ``:default`` value that does not match its own schema."""
+        value = literal(default)
+        if default is None or value is UNKNOWN:
+            return
+        problems = Checker({**schema, "$defs": self.defs}).check(value)
+        if problems:
+            self._issue(ERROR, "schema-invalid-default",
+                        f"`:default {default.text[:40]}` of {what} does not match it: {problems[0]}", default.line)
+
+    def _check_regex(self, pattern: Any, line: int | None) -> None:
+        if not isinstance(pattern, str):
+            return
+        try:
+            re.compile(pattern)
+        except re.error as e:
+            if any(str(e).startswith(m) for m in _REGEX_ERRORS):
+                self._issue(ERROR, "schema-invalid-regex", f"regex `{pattern}` is invalid: {e}", line)
+
     def _props(self, items: list[Form]) -> tuple[dict, dict, list[Form]]:
         """Split ``[props? children...]``; return (json props, raw props form map, children)."""
         if items and items[0].kind == edn.MAP:
@@ -263,6 +383,14 @@ class MalliConverter:
         return {}, {}, items
 
     def _convert(self, form: Form, context: Any) -> dict:
+        saved = self._context, self._line
+        self._context, self._line = context, form.line
+        try:
+            return self._convert_form(form, context)
+        finally:
+            self._context, self._line = saved
+
+    def _convert_form(self, form: Form, context: Any) -> dict:
         k = form.kind
         if k == edn.KEYWORD:
             return self._keyword(form, context)
@@ -275,6 +403,7 @@ class MalliConverter:
         if k == edn.QUOTE and form.items:
             return self._convert(form.items[0], context)
         if k == edn.REGEX:
+            self._check_regex(form.value, form.line)
             return {"type": "string", "pattern": form.value}
         if k in (edn.STRING, edn.NUMBER, edn.BOOL, edn.NIL):
             return {"const": edn_value(form)}
@@ -283,7 +412,7 @@ class MalliConverter:
             t = form.get("type")
             if t is not None and t.kind == edn.KEYWORD:
                 return self._keyword(t, context)
-        self.warnings.append(f"unsupported schema form `{form.text[:60]}` (line {form.line})")
+        self._approximate(f"unsupported schema form `{form.text[:60]}`", form.line)
         return {"$comment": f"unsupported Malli form {form.text[:80]}"}
 
     def _call(self, form: Form, context: Any) -> dict:
@@ -315,7 +444,7 @@ class MalliConverter:
             base["properties"] = {p: v for p, v in base.get("properties", {}).items() if p not in drop}
             base["required"] = [r for r in base.get("required", []) if r not in drop]
             return base
-        self.warnings.append(f"unsupported schema call `{form.text[:60]}` (line {form.line})")
+        self._approximate(f"computed schema `{form.text[:60]}`", form.line)
         return {"$comment": f"computed schema {form.text[:80]}"}
 
     def _inline_object(self, form: Form, context: Any) -> dict:
@@ -335,19 +464,37 @@ class MalliConverter:
         for entry in items:
             if entry.kind == edn.KEYWORD:  # [:map ::registry-key]
                 key = self._entry_key(entry)
+                if key in properties:
+                    self._issue(ERROR, "schema-duplicate-key", f"`:map` has the key `:{key}` more than once", entry.line)
                 properties[key] = self._keyword(entry, context)
                 required.append(key)
                 continue
             if entry.kind != edn.VECTOR or not entry.items:
+                self._issue(ERROR, "schema-invalid-entry",
+                            f"`:map` entry `{entry.text[:40]}` is not `[key props? schema]`", entry.line)
                 continue
             key = self._entry_key(entry.items[0])
+            if key in properties:
+                self._issue(ERROR, "schema-duplicate-key", f"`:map` has the key `:{key}` more than once", entry.line)
             rest = entry.items[1:]
             entry_props: dict = {}
+            raw_entry_props: Form | None = None
             if rest and rest[0].kind == edn.MAP:
+                raw_entry_props = rest[0]
                 entry_props = edn_value(rest[0]) or {}
                 rest = rest[1:]
-            schema = self._convert(rest[0], context) if rest else (
-                self._keyword(entry.items[0], context) if entry.items[0].kind == edn.KEYWORD else {})
+            if len(rest) > 1:
+                self._issue(ERROR, "schema-invalid-entry",
+                            f"`:map` entry `:{key}` has {len(rest)} schemas; use one, or `[:and ...]`", entry.line)
+            if rest:
+                schema = self._convert(rest[0], context)
+            elif entry.items[0].kind == edn.KEYWORD and "/" in key:
+                schema = self._keyword(entry.items[0], context)
+            else:
+                self._issue(ERROR, "schema-invalid-entry", f"`:map` entry `:{key}` has no schema", entry.line)
+                schema = {}
+            if raw_entry_props is not None and isinstance(schema, dict):
+                self._check_default(raw_entry_props.get("default"), schema, f"`:{key}`")
             for meta in ("description", "title"):
                 if isinstance(entry_props.get(meta), str) and isinstance(schema, dict):
                     schema = {**schema, meta: entry_props[meta]}
@@ -362,6 +509,26 @@ class MalliConverter:
         return self._with_props(out, "map", {k: v for k, v in props.items() if k != "closed"})
 
     def _vector(self, form: Form, context: Any) -> dict:
+        head = form.items[0] if form.items else None
+        if head is None or head.kind != edn.KEYWORD:
+            return self._vector_schema(form, context)
+        t = str(head.value)
+        _props, raw_props, children = self._props(form.items[1:])
+        need = _MIN_CHILDREN.get(t, 0)
+        if len(children) < need:
+            what = "child schema" if need == 1 else "child schemas"
+            self._issue(ERROR, "schema-arity", f"`[:{t}]` needs at least {need} {what}, but has {len(children)}",
+                        form.line)
+            return {"$comment": f"invalid Malli schema {form.text[:80]}"}
+        if t == "re":
+            pattern = children[0]
+            self._check_regex(pattern.value if pattern.kind in (edn.REGEX, edn.STRING) else None, pattern.line)
+        out = self._vector_schema(form, context)
+        if "default" in raw_props and isinstance(out, dict):
+            self._check_default(raw_props["default"], out, f"`[:{t} ...]`")
+        return out
+
+    def _vector_schema(self, form: Form, context: Any) -> dict:
         if not form.items:
             return {"type": "array"}
         head = form.items[0]
@@ -431,7 +598,7 @@ class MalliConverter:
         if t == "re" and children:
             return {"type": "string", "pattern": children[0].value if children[0].kind in (edn.REGEX, edn.STRING) else children[0].text}
         if t == "fn":
-            self.warnings.append(f"opaque :fn schema (line {form.line})")
+            self._approximate("a `:fn` predicate allows any value", form.line)
             return {"$comment": f"Malli :fn predicate {children[0].text[:60] if children else ''}"}
         if t == "ref" and children:
             ref = children[0]

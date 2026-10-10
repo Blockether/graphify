@@ -16,7 +16,10 @@
   (-> ctx
       (assoc :service-name :notifications-svc)
       (reg-cmd :send-email send-email
-               :consumes [:map [:attrs [:map [:template :keyword] [:to {:optional true} s/Email]]]])
+               :consumes [:map [:attrs [:map
+                                         [:template :keyword]
+                                         [:to {:optional true} s/Email]
+                                         [:priority {:optional true} [:int {:default "high"}]]]]])
       (reg-cmd :log-audit log-audit)
       (reg-event :email-sent (fn [agg _] (update agg :sent (fnil inc 0))))
       (reg-event :audit-logged (fn [agg _] agg))

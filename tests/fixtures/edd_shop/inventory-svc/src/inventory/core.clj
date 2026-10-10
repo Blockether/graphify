@@ -37,7 +37,9 @@
   [_ctx event]
   {:service :payments-svc
    :commands [{:cmd-id :authorize-payment
-               :id (get-in event [:attrs :order-id])}]})
+               :id (get-in event [:attrs :order-id])
+               :attrs {:amount (get-in event [:attrs :total])
+                       :method :card}}]})
 
 (defn after-shortage
   [_ctx event]

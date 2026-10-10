@@ -62,7 +62,7 @@ def test_symbols_become_defs_and_nested_refs_follow():
     assert doc["properties"]["items"]["items"] == {"$ref": "#/$defs/Item"}
     assert set(doc["$defs"]) == {"Money", "Item"}
     assert doc["$defs"]["Item"]["properties"]["price"] == {"$ref": "#/$defs/Money"}
-    assert conv.warnings == []
+    assert conv.issues == []
 
 
 def test_recursive_schema_terminates():
@@ -81,10 +81,11 @@ def test_merge_multi_and_map_of():
     assert doc["additionalProperties"] == {"type": "integer"}
 
 
-def test_unknown_and_opaque_schemas_warn():
+def test_unknown_and_opaque_schemas_are_reported():
     doc, conv = _convert("[:map [:a Missing] [:b [:fn pos?]] [:c :no-such-type]]")
     assert all("$comment" in doc["properties"][k] for k in "abc")
-    assert len(conv.warnings) == 3
+    assert [(i.severity, i.code) for i in conv.issues] == [
+        ("warning", "schema-unresolved"), ("info", "schema-approximation"), ("error", "schema-unknown-type")]
 
 
 def test_merge_objects_falls_back_to_all_of():
