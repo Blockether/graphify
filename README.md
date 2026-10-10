@@ -6,7 +6,7 @@
   <a href="https://trendshift.io/repositories/25296?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-25296" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/25296" alt="Graphify-Labs%2Fgraphify | Trendshift" width="250" height="55"/></a>
 </p>
 
-> **Blockether fork.** This fork adds full Clojure support (`.clj`, `.cljs`, `.cljc`, `.bb`, `deps.edn`, `project.clj`) through [Blockether/tree-sitter-clojure](https://github.com/Blockether/tree-sitter-clojure), including Clojure 1.12 and 1.13 syntax. Namespaces, vars, macros, protocols, records, multimethods, specs and tests become nodes, and calls resolve across namespaces. Install it with `uv tool install "graphifyy @ git+https://github.com/Blockether/graphify@v0.9.84-blockether.1"` (a C compiler builds the grammar).
+> **Blockether fork.** This fork adds full Clojure support (`.clj`, `.cljs`, `.cljc`, `.bb`, `deps.edn`, `project.clj`) through [Blockether/tree-sitter-clojure](https://github.com/Blockether/tree-sitter-clojure), including Clojure 1.12 and 1.13 syntax. Namespaces, vars, macros, protocols, records, multimethods, specs and tests become nodes, and calls resolve across namespaces. Install it with `uv tool install "graphifyy @ git+https://github.com/Blockether/graphify@v0.9.84-blockether.2"` (a C compiler builds the grammar).
 
 <div align="center">
 <details><summary><b>Read this in other languages</b></summary>
