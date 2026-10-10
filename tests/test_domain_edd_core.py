@@ -134,7 +134,38 @@ def test_deliberate_defects_are_reported(model):
     f = _finding(model, "dynamic-reference", ":next-step")
     assert (f.severity, f.file) == ("info", "shipping-svc/src/shipping/main.clj")
     errors = sorted(f.code for f in model.findings if f.severity == "error")
-    assert errors == ["duplicate-command", "missing-command", "missing-query", "missing-query", "unresolved-handler"]
+    assert errors == ["duplicate-command", "missing-command", "missing-query", "missing-query", "payload-invalid",
+                      "payload-invalid", "schema-invalid-bounds", "schema-invalid-default", "schema-invalid-regex",
+                      "schema-unknown-type", "schema-unresolved", "unresolved-handler"]
+
+
+@pytest.mark.parametrize("code, ref, file, line, text", [
+    ("schema-unknown-type", "catalog-svc/query/get-product", "catalog-svc/src/catalog/main.clj", 22, "`:stirng`"),
+    ("schema-invalid-bounds", "customers-svc/command/register-customer", "customers-svc/src/customers/main.clj",
+     29, "`:min 3` greater than `:max 1`"),
+    ("schema-invalid-regex", "customers-svc/command/register-customer", "customers-svc/src/customers/main.clj",
+     31, "unterminated character set"),
+    ("schema-invalid-default", "notifications-svc/command/send-email", "notifications-svc/src/notifications/main.clj",
+     22, 'is string "high", expected integer'),
+    ("schema-unresolved", "shipping-svc/command/dispatch-shipment", "shipping-svc/src/shipping/main.clj", 52,
+     "`s/TrackingNumber` is not defined"),
+    ("payload-invalid", "notifications-svc/command/send-email", "shipping-svc/src/shipping/main.clj", 29,
+     'attrs.template: is string "shipment-created", expected keyword'),
+    ("payload-invalid", "orders-svc/command/place-order", "storefront/src/storefront/api.clj", 21,
+     "attrs.shipping-address: required key is missing; attrs.lines: has 0 items, expected at least 1"),
+])
+def test_schema_and_payload_defects_are_reported(model, code, ref, file, line, text):
+    hits = [f for f in model.findings if f.code == code and str(f.ref) == ref and text in f.message]
+    assert len(hits) == 1, [f.message for f in model.findings if f.code == code]
+    assert (hits[0].severity, hits[0].file, hits[0].line) == ("error", file, line)
+
+
+def test_valid_payloads_and_schemas_have_no_findings(model):
+    # inventory-svc sends a complete payment payload; place-order! in storefront is valid.
+    flagged = {f.file for f in model.findings if f.code == "payload-invalid"}
+    assert flagged == {"shipping-svc/src/shipping/main.clj", "storefront/src/storefront/api.clj"}
+    schema_refs = {str(f.ref) for f in model.findings if f.code.startswith("schema-") and f.severity == "error"}
+    assert "orders-svc/command/place-order" not in schema_refs
 
 
 def test_test_files_are_excluded_unless_asked(model):
@@ -199,7 +230,7 @@ def test_domain_cli_json_and_strict(tmp_path):
     assert r.returncode == 1, r.stderr  # the fixture has errors
     data = json.loads(r.stdout)
     assert data["plugins"] == ["edd-core"]
-    assert data["finding_counts"]["error"] == 5
+    assert data["finding_counts"]["error"] == 12
     assert Path(data["markdown"]).is_file()
     r = _graphify("domain", str(FIXTURE), "--out", str(tmp_path / "out2"))
     assert r.returncode == 0, r.stderr

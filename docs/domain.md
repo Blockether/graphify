@@ -41,6 +41,11 @@ The Malli converter supports maps, `:map-of`, `:vector`, `:sequential`, `:set`, 
 `string?` and `uuid?`, size and range properties, and schema vars. A named schema var becomes a
 `$defs` entry. A schema that has no exact JSON Schema form gives a `schema-approximation` finding.
 
+The converter also checks each schema. It reports unknown types, `:min` above `:max`, a `:default`
+that the schema rejects, a regex that cannot compile, duplicate map keys and schema vars that are
+not defined. The plugin then checks each call with constant data against the full `:consumes`
+schema of its target. `DOMAIN.md` lists these problems under each schema.
+
 ## The edd-core plugin
 
 The built-in `edd-core` plugin reads [edd-core](https://github.com/alpha-prosoft/edd-core)
@@ -70,6 +75,10 @@ value that it cannot compute gives a `dynamic-reference` finding.
 | `unscoped-call` | warning | A function outside a service calls an element without a `:service` key. |
 | `command-entry-point`, `command-without-schema`, `query-unused` | info | Only clients start a command, a command has no `:consumes` schema, or no code calls a query. |
 | `dynamic-reference`, `dynamic-registration` | info | A value is not constant, so the link is not certain. |
+| `payload-invalid` | error | A call sends data that the `:consumes` schema of its target rejects. |
+| `schema-unknown-type`, `schema-invalid-bounds`, `schema-invalid-default` | error | A schema names an unknown type, has impossible bounds or a default that it rejects. |
+| `schema-invalid-regex`, `schema-duplicate-key`, `schema-invalid-entry`, `schema-arity` | error | A schema has a regex that cannot compile, a repeated key or a malformed entry. |
+| `schema-unresolved` | error or warning | A schema var is not defined (error), or comes from a library outside the corpus (warning). |
 | `schema-approximation` | info | A Malli schema has no exact JSON Schema form. |
 
 Test files are not part of the analysis. Calls from tests do not hide a missing registration.

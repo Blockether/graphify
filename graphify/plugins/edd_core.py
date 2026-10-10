@@ -12,7 +12,8 @@ follows each handler into its code to find:
 
 It converts the ``:consumes`` and ``:produces`` Malli schemas to JSON Schema,
 with the keys that edd-core adds (``:id`` and ``:cmd-id``, ``:query-id``,
-``:result``).
+``:result``), and reports errors in the schemas. It checks each command and
+query map in the code against the full ``:consumes`` schema of its target.
 """
 
 from __future__ import annotations
@@ -25,9 +26,10 @@ from graphify.domain import edn
 from graphify.domain.corpus import Corpus, SourceFile
 from graphify.domain.edn import Form
 from graphify.domain.evaluate import FN_HEADS, LET_HEADS, Evaluator, arities, pick_arity
-from graphify.domain.malli import MalliConverter, merge_objects
+from graphify.domain.malli import MalliConverter, literal, merge_objects
 from graphify.domain.model import ERROR, INFO, WARNING, DomainModel, Element, Finding, KindSpec, Ref, Relation
 from graphify.domain.plugin import DomainPlugin
+from graphify.domain.validate import UNKNOWN, Checker, Keyword
 
 EDD = "edd.core"
 REG_WITH_ID = {"reg-cmd", "reg-query", "reg-event", "reg-event-fx", "reg-feature"}
@@ -35,6 +37,7 @@ REG_WITHOUT_ID = {"reg-fx", "reg-agg-filter", "reg-service-schema"}
 REGISTRATIONS = {f"{EDD}/{n}": n for n in REG_WITH_ID | REG_WITHOUT_ID}
 ID_KEYS = {"event-id": "event", "cmd-id": "command", "query-id": "query"}
 MAX_FOLLOW_DEPTH = 6
+MAX_PROBLEMS_SHOWN = 4
 
 COMMAND, QUERY, EVENT, EFFECT, FUNCTION = "command", "query", "event", "effect", "function"
 
@@ -47,6 +50,7 @@ class Invocation:
     file: str
     line: int
     via: str | None = None  # the source text when the id was computed
+    payload: Any = None  # the static value of a command or query map, for schema checks
 
 
 @dataclass
@@ -107,6 +111,8 @@ class EddCorePlugin(DomainPlugin):
         self.with_fx: set[Ref] = set()
         self.reg_files: set[str] = set()
         self.reached: set[str] = set()
+        self.payloads: dict[tuple, tuple[Ref, Ref, Invocation]] = {}
+        self.schema_issues: set[tuple] = set()
         # Pass 1: find the registrations, the services and the handler symbols.
         for sf in self._files(corpus):
             if not sf.requires(EDD):
@@ -132,6 +138,7 @@ class EddCorePlugin(DomainPlugin):
         self._code_callers()
 
     def finalize(self, corpus: Corpus, model: DomainModel) -> None:
+        self._check_payloads(model)
         for ref, n in self.counts.items():
             if n > 1:
                 e = model.elements.get(ref)
@@ -271,8 +278,9 @@ class EddCorePlugin(DomainPlugin):
                     continue
                 names = self._ids(value, sf, env)
                 via = None if value.kind == edn.KEYWORD else value.text
+                payload = self._payload(form, sf, env) if kind in (COMMAND, QUERY) and names else None
                 for name in names:
-                    scan.found.append(Invocation(kind, name, service, sf.rel, value.line, via))
+                    scan.found.append(Invocation(kind, name, service, sf.rel, value.line, via, payload))
                 if not names:
                     scan.dynamic.append(Dynamic(key, value.text, sf.rel, value.line))
         elif form.kind == edn.LIST and form.head is not None and form.head.kind == edn.SYMBOL:
@@ -389,6 +397,66 @@ class EddCorePlugin(DomainPlugin):
         if inv.via:
             attrs["resolved_from"] = inv.via
         self.model.relate(Relation(source, target, relation, inv.file, inv.line, True, attrs, self.name))
+        if isinstance(inv.payload, dict):
+            self.payloads.setdefault((source, target, inv.file, inv.line), (source, target, inv))
+
+    # -- payload checks ----------------------------------------------------------
+    def _payload(self, form: Form, sf: SourceFile, env: dict) -> Any:
+        """The value of a command or query map, without the routing key ``:service``."""
+        value = self._static(form, sf, env, 0)
+        if isinstance(value, dict):
+            value.pop("service", None)
+        return value
+
+    def _static(self, form: Form, sf: SourceFile, env: dict, depth: int) -> Any:
+        """The value of ``form`` as far as the code shows it; :data:`UNKNOWN` elsewhere."""
+        if depth > MAX_FOLLOW_DEPTH:
+            return UNKNOWN
+        k = form.kind
+        if k in (edn.VECTOR, edn.SET):
+            return [self._static(i, sf, env, depth + 1) for i in form.items]
+        if k == edn.MAP:
+            out = {}
+            for key, item in form.pairs():
+                if key.kind not in (edn.KEYWORD, edn.STRING):
+                    return UNKNOWN
+                out[str(key.value)] = self._static(item, sf, env, depth + 1)
+            return out
+        if k == edn.SYMBOL:
+            bound = env.get(str(form.value))
+            if isinstance(bound, Form):
+                return self._static(bound, sf, env, depth + 1)
+            if bound is None:
+                d = self.corpus.definition(form, sf)
+                if d is not None and d.head == "def" and d.value is not None and d.value.kind in (edn.MAP, edn.VECTOR):
+                    return self._static(d.value, d.file, {}, depth + 1)
+        if k in (edn.SYMBOL, edn.LIST):
+            consts = self.ev.values(form, sf, env)
+            if len(consts) != 1:
+                return UNKNOWN
+            c = consts[0]
+            if c.kind == "kw":
+                return Keyword(str(c.value))
+            if c.kind == "nil":
+                return None
+            return c.value if c.kind in ("str", "bool") or isinstance(c.value, (int, float)) else UNKNOWN
+        return literal(form)
+
+    def _check_payloads(self, model: DomainModel) -> None:
+        for source, target, inv in self.payloads.values():
+            element = model.elements.get(target)
+            schema = element.schemas.get("consumes") if element is not None else None
+            if not schema:
+                continue
+            problems = Checker(schema).check(inv.payload)
+            if not problems:
+                continue
+            shown = "; ".join(str(p) for p in problems[:MAX_PROBLEMS_SHOWN])
+            if len(problems) > MAX_PROBLEMS_SHOWN:
+                shown += f"; and {len(problems) - MAX_PROBLEMS_SHOWN} more"
+            model.report(Finding(ERROR, "payload-invalid",
+                                 f"{source} sends {target.kind} `{target.name}` with data that its `:consumes` "
+                                 f"schema rejects: {shown}.", inv.file, inv.line, target, self.name))
 
     # -- schemas ---------------------------------------------------------------
     def _converter(self, sf: SourceFile) -> MalliConverter:
@@ -400,7 +468,11 @@ class EddCorePlugin(DomainPlugin):
                 return None
             return d.qualified, d.value, d.file
 
-        return MalliConverter(resolve)
+        def is_local(symbol: Form, ctx: SourceFile) -> bool:
+            qualified = corpus.resolve(symbol, ctx)
+            return "/" not in qualified or qualified.rsplit("/", 1)[0] in corpus.by_ns
+
+        return MalliConverter(resolve, is_local=is_local)
 
     def _schema(self, element: Element, part: str, form: Form | None, sf: SourceFile, base: dict | None,
                 wrap_result: bool = False) -> None:
@@ -420,9 +492,16 @@ class EddCorePlugin(DomainPlugin):
             d = self.corpus.definition(form, sf)
             if d is not None and d.value is not None:
                 element.sources[part] = f";; {d.qualified} ({d.file.rel}:{d.line})\n{d.value.text}"
-        for w in conv.warnings:
-            self.model.report(Finding(INFO, "schema-approximation", f"{element.ref} {part}: {w}.",
-                                      sf.rel, form.line, element.ref, self.name))
+        severity = {"error": ERROR, "warning": WARNING, "info": INFO}
+        for issue in conv.issues:
+            file = issue.context.rel if isinstance(issue.context, SourceFile) else sf.rel
+            line = issue.line or form.line
+            key = (issue.code, file, line, issue.message)
+            if key in self.schema_issues:
+                continue  # a shared schema reports each problem once
+            self.schema_issues.add(key)
+            self.model.report(Finding(severity[issue.severity], issue.code,
+                                      f"{element.ref} {part}: {issue.message}.", file, line, element.ref, self.name))
 
     # -- registrations -----------------------------------------------------------
     def _element(self, kind: str, service: str, name: str, sf: SourceFile, line: int,

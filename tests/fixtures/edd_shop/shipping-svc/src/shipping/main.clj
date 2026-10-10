@@ -25,7 +25,8 @@
 
 (defn on-created [_ctx event]
   [{:service :notifications-svc
-    :commands [{:cmd-id :send-email :id (:id event) :attrs {:template :shipment-created}}]}
+    ;; Deliberate defect: :template is a keyword in the schema, not a string.
+    :commands [{:cmd-id :send-email :id (:id event) :attrs {:template "shipment-created"}}]}
    (carrier-command (carrier-for (get-in event [:attrs :country])) event)])
 
 (defn- next-step
@@ -48,7 +49,7 @@
       (assoc :service-name :shipping-svc)
       (edd/reg-cmd :create-shipment create-shipment :consumes CreateShipment)
       (edd/reg-cmd :dispatch-shipment dispatch-shipment
-                   :consumes [:map [:attrs [:map [:carrier [:enum :dhl :ups]] [:tracking :string]]]])
+                   :consumes [:map [:attrs [:map [:carrier [:enum :dhl :ups]] [:tracking s/TrackingNumber]]]])
       (edd/reg-event :shipment-created (fn [agg e] (merge agg (:attrs e))))
       (edd/reg-event :shipment-dispatched (fn [agg _] (assoc agg :status :dispatched)))
       (edd/reg-event-fx :shipment-created on-created)

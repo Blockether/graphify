@@ -14,6 +14,15 @@
                                                 :lines lines
                                                 :shipping-address address}}]}))
 
+(defn reorder!
+  "Deliberate defect: no :shipping-address, and :lines must not be empty."
+  [ctx customer-id]
+  (client/call-service ctx {:service orders-service
+                            :commands [{:cmd-id place-order-cmd
+                                        :id (random-uuid)
+                                        :attrs {:customer-id customer-id
+                                                :lines []}}]}))
+
 (defn browse [ctx]
   (client/query-service ctx {:service :catalog-svc
                              :query {:query-id :list-products}}))

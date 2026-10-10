@@ -25,7 +25,10 @@
       (assoc :service-name :customers-svc)
       (edd/reg-service-schema [:map [:tier [:enum :basic :gold]]])
       (edd/reg-cmd :register-customer register-customer
-                   :consumes [:map [:attrs [:map [:name :string] [:email s/Email]]]])
+                   :consumes [:map [:attrs [:map
+                                              [:name [:string {:min 3 :max 1}]]
+                                              [:email s/Email]
+                                              [:phone {:optional true} [:re "^[0-9+"]]]]])
       (edd/reg-cmd :update-address update-address
                    :consumes [:map [:attrs s/Address]])
       ;; Deliberate defect: the same command is registered twice.

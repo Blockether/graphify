@@ -274,6 +274,16 @@ def render_markdown(model: DomainModel) -> str:
             w("")
             w(f"File: [`{schema_path(e.ref, part)}`]({schema_path(e.ref, part)})")
             w("")
+            problems = [f for f in model.sorted_findings() if f.ref == e.ref and (
+                (f.code.startswith("schema-") and f.message.startswith(f"{e.ref} {part}:"))
+                or (part == "consumes" and f.code == "payload-invalid"))]
+            if problems:
+                w("Problems:")
+                w("")
+                for f in problems:
+                    loc = f" (`{f.file}:{f.line}`)" if f.file else ""
+                    w(f"- **{f.severity}** `{f.code}`: {f.message}{loc}")
+                w("")
             if part in e.sources:
                 w("<details><summary>Malli source</summary>")
                 w("")

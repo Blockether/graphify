@@ -23,3 +23,10 @@ Deliberate defects, one for each check:
 | `book-inpost` and `book-dhl` computed from a `case` | shipping `carrier-command` | resolved; `unknown-service` for `carriers-gateway` |
 | ids in `def` vars and `let` bindings | orders `ids`, inventory, notifications, storefront | resolved like literals |
 | `:order-rejected` starts `:retry-placement`, which can emit `:order-rejected` again | orders | cycle |
+| `:template` sent as a string, the schema wants a keyword | shipping `on-created` → `:send-email` | `payload-invalid` |
+| `reorder!` sends no `:shipping-address` and empty `:lines` | storefront `api.clj` | `payload-invalid` |
+| `s/TrackingNumber` is not defined | shipping `:dispatch-shipment` | `schema-unresolved` |
+| `:stirng` typo | catalog `:get-product` | `schema-unknown-type` |
+| `[:string {:min 3 :max 1}]` | customers `:register-customer` | `schema-invalid-bounds` |
+| `[:re "^[0-9+"]` | customers `:register-customer` | `schema-invalid-regex` |
+| `[:int {:default "high"}]` | notifications `:send-email` | `schema-invalid-default` |
