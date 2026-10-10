@@ -2518,6 +2518,11 @@ def dispatch_command(cmd: str) -> None:
             else:
                 print(f"Done - {len(communities)} communities. GRAPH_REPORT.md and graph.json updated.")
 
+    elif cmd == "domain":
+        from graphify.domain.cli import main as _domain_main
+
+        sys.exit(_domain_main(sys.argv[2:]))
+
     elif cmd == "update":
         force = os.environ.get("GRAPHIFY_FORCE", "").lower() in ("1", "true", "yes")
         no_cluster = False

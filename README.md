@@ -6,7 +6,7 @@
   <a href="https://trendshift.io/repositories/25296?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-25296" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/25296" alt="Graphify-Labs%2Fgraphify | Trendshift" width="250" height="55"/></a>
 </p>
 
-> **Blockether fork.** This fork adds full Clojure support (`.clj`, `.cljs`, `.cljc`, `.bb`, `deps.edn`, `project.clj`) through [Blockether/tree-sitter-clojure](https://github.com/Blockether/tree-sitter-clojure), including Clojure 1.12 and 1.13 syntax. Namespaces, vars, macros, protocols, records, multimethods, specs and tests become nodes, and calls resolve across namespaces. Install it with `uv tool install "graphifyy @ git+https://github.com/Blockether/graphify@v0.9.84-blockether.2"` (a C compiler builds the grammar).
+> **Blockether fork.** This fork adds full Clojure support (`.clj`, `.cljs`, `.cljc`, `.bb`, `deps.edn`, `project.clj`) through [Blockether/tree-sitter-clojure](https://github.com/Blockether/tree-sitter-clojure), including Clojure 1.12 and 1.13 syntax. Namespaces, vars, macros, protocols, records, multimethods, specs and tests become nodes, and calls resolve across namespaces. `graphify domain` maps framework flows (commands, queries, events and their Malli schemas) through plugins; see [Domain flows](#domain-flows-blockether-fork). Install it with `uv tool install "graphifyy @ git+https://github.com/Blockether/graphify@v0.9.84-blockether.3"` (a C compiler builds the grammar).
 
 <div align="center">
 <details><summary><b>Read this in other languages</b></summary>
@@ -328,6 +328,14 @@ To remove graphify from all platforms at once: `graphify uninstall` (add `--purg
 ## What's in the report
 
 `GRAPH_REPORT.md` summarizes the god nodes, communities, and key paths for broad architecture review. How the graph is built and what it contains: **[How graphify works](https://docs.graphify.com/concepts/architecture)**.
+
+---
+
+## Domain flows (Blockether fork)
+
+`graphify domain .` reads the commands, queries, events and effects that your Clojure services register, and connects them across services. It writes `graphify-out/domain/DOMAIN.md` with Mermaid flowcharts, sequence diagrams and findings, `domain.json`, and one JSON Schema for each Malli schema. It reports calls to commands or queries that no service registers. `graphify update .` adds the same elements to the graph.
+
+The built-in `edd-core` plugin reads [edd-core](https://github.com/alpha-prosoft/edd-core) services. Add a plugin for another framework as a Python file in `.graphify/plugins/`, as a package entry point or with `GRAPHIFY_PLUGINS`. Guide: **[Domain flows](docs/domain.md)**.
 
 ---
 
