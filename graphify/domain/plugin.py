@@ -156,8 +156,18 @@ def discover(project_root: str | Path | None = None, specs: Iterable[str] | None
     root = Path(project_root) if project_root is not None else None
     found: dict[str, Any] = {}
     if specs:
+        known: dict[str, Any] | None = None
         for spec in specs:
-            for p in load_spec(spec, root):
+            try:
+                loaded = load_spec(spec, root)
+            except PluginError:
+                # A bare name can also name a plugin from the project directory or the environment.
+                if known is None:
+                    known = {p.name: p for p in discover(root, None, env, [])}
+                if spec.strip() not in known:
+                    raise
+                loaded = [known[spec.strip()]]
+            for p in loaded:
                 found[p.name] = p
         return list(found.values())
     sources: list[str] = list(BUILTIN_PLUGINS)

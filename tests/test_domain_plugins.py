@@ -84,6 +84,22 @@ def test_project_plugin_dir_is_discovered_and_detected(tmp_path):
     assert [p.name for p in res.plugins] == ["routes"]  # edd-core does not detect edd.core here
 
 
+def test_named_spec_finds_project_and_env_plugins(tmp_path, monkeypatch):
+    # `--plugin <name>` must also reach plugins from .graphify/plugins/ and GRAPHIFY_PLUGINS.
+    root = _project(tmp_path)
+    plugin_dir = root / ".graphify" / "plugins"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "routes.py").write_text(ROUTES_PLUGIN, encoding="utf-8")
+    assert [p.name for p in discover(root, ["routes"])] == ["routes"]
+    assert analyze(root, specs=["routes"]).model.counts() == {"route": 2}
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    (other / "web_routes.py").write_text(ROUTES_PLUGIN.replace('name = "routes"', 'name = "web"'), encoding="utf-8")
+    monkeypatch.setenv(plugin_mod.ENV_VAR, str(other))
+    assert [p.name for p in discover(root, ["web"])] == ["web"]
+    with pytest.raises(PluginError, match="no-such-plugin"):
+        discover(root, ["no-such-plugin"])
+
 def test_env_var_and_module_specs(tmp_path, monkeypatch):
     (tmp_path / "my_routes.py").write_text(ROUTES_PLUGIN, encoding="utf-8")
     monkeypatch.syspath_prepend(str(tmp_path))
