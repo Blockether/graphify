@@ -54,6 +54,11 @@ from graphify.extractors.fortran import _cpp_preprocess, extract_fortran  # noqa
 from graphify.extractors.go import _GO_PREDECLARED_FUNCS, extract_go  # noqa: F401
 from graphify.extractors.json_config import extract_json  # noqa: F401
 from graphify.extractors.commonlisp import extract_commonlisp  # noqa: F401
+from graphify.extractors.clojure import (  # noqa: F401
+    extract_clojure,
+    remap_clojure_ids,
+    resolve_clojure_references,
+)
 from graphify.extractors.markdown import extract_markdown, _MD_LINK_INDEX_CACHE  # noqa: F401
 from graphify.extractors.ocaml import extract_ocaml  # noqa: F401
 from graphify.extractors.pascal_forms import extract_delphi_form, extract_lazarus_form  # noqa: F401
@@ -3371,9 +3376,11 @@ _LANG_FAMILY_BY_EXT: dict[str, str] = {
     ".js": "jsts", ".jsx": "jsts", ".mjs": "jsts", ".cjs": "jsts",
     ".ts": "jsts", ".tsx": "jsts", ".mts": "jsts", ".cts": "jsts",
     ".vue": "jsts", ".svelte": "jsts", ".astro": "jsts",
+    ".cljs": "jsts",  # ClojureScript compiles into the JS module graph
     # JVM interop
     ".java": "jvm", ".kt": "jvm", ".kts": "jvm",
     ".scala": "jvm", ".groovy": "jvm", ".gradle": "jvm",
+    ".clj": "jvm", ".cljc": "jvm", ".bb": "jvm",
     # C-family: shared headers, Objective-C/C++ mix, Swift↔ObjC bridging
     ".c": "native", ".h": "native", ".cpp": "native", ".cc": "native",
     ".cxx": "native", ".hpp": "native", ".cu": "native", ".cuh": "native",
@@ -7337,6 +7344,11 @@ _DISPATCH: dict[str, Any] = {
     ".cl": extract_commonlisp,
     ".lsp": extract_commonlisp,
     ".asd": extract_commonlisp,
+    ".clj": extract_clojure,
+    ".cljs": extract_clojure,
+    ".cljc": extract_clojure,
+    ".bb": extract_clojure,
+    ".edn": extract_clojure,
     ".v": extract_verilog,
     ".sv": extract_verilog,
     ".svh": extract_verilog,
@@ -7438,6 +7450,7 @@ _SHEBANG_DISPATCH: dict[str, Any] = {
     "php": extract_php,
     "julia": extract_julia,
     "Rscript": extract_r,
+    "bb": extract_clojure,
 }
 
 
@@ -8518,6 +8531,7 @@ def extract(
         # objc_field_types["tables"] is keyed BY class node id - the one bucket
         # the #1529 rewrites missed (#3150).
         _remap_objc_field_tables(per_file, id_remap)
+        remap_clojure_ids(per_file, id_remap)
     if prefix_remap:
         sym_remap: dict[str, str] = {}
         edge_alias_candidates: dict[str, set[str]] = {}
@@ -8586,6 +8600,7 @@ def extract(
                     if en in sym_remap:
                         ext["nid"] = sym_remap[en]
             _remap_objc_field_tables(per_file, sym_remap)
+            remap_clojure_ids(per_file, sym_remap)
         if edge_alias_candidates:
             def _edge_key(edge: dict) -> str:
                 # target_file is a transient stamp (#1814/#1983); exclude it
@@ -8774,6 +8789,18 @@ def extract(
         except Exception as exc:
             import logging
             logging.getLogger(__name__).warning("Cross-file import resolution failed, skipping: %s", exc)
+    # Clojure namespaces are global names: bind qualified/referred vars and
+    # `imports` of in-corpus namespaces exactly, before the label-based rewire.
+    _clj_sel = [(r, p) for r, p in zip(per_file, paths) if isinstance(r, dict) and r.get("clojure")]
+    if _clj_sel:
+        try:
+            resolve_clojure_references(
+                [r for r, _ in _clj_sel], [p for _, p in _clj_sel], all_nodes, all_edges,
+                resolution_context_nodes,
+            )
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Clojure reference resolution failed, skipping: %s", exc)
     _rewire_unique_stub_nodes(all_nodes, all_edges)
 
     # Cross-file Java import resolution
