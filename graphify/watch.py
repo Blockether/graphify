@@ -2203,6 +2203,10 @@ def _rebuild_code(
         legacy_layout = existing_graph.exists() and not _is_single_line(existing_graph)
 
         _relativize_source_files(result, project_root, scope=watch_root)
+        # Domain plugins (edd-core and others) add framework concepts such as
+        # commands, queries and events, with links to their handler code.
+        from graphify.domain.graph import augment as _augment_domain
+        _augment_domain(result, project_root, code_files, out / "domain")
         # Source files re-extracted this run — their symbol sets may legitimately
         # shrink (a removed function), so the shrink-guard should not block the
         # write when every lost node belongs to one of them (or a deleted file).

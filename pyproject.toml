@@ -159,7 +159,7 @@ dev = [
 package = true
 
 [tool.setuptools]
-packages = ["graphify", "graphify.extractors", "graphify.exporters"]
+packages = ["graphify", "graphify.extractors", "graphify.exporters", "graphify.domain", "graphify.plugins"]
 include-package-data = false
 
 [tool.setuptools.package-data]
