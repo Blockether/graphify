@@ -1,5 +1,7 @@
 """Graph analysis: god nodes (most connected), surprising connections (cross-community), suggested questions."""
 from __future__ import annotations
+import random
+from collections import deque
 from pathlib import Path
 import networkx as nx
 
@@ -472,6 +474,60 @@ def _cross_community_surprises(
     return deduped[:top_n]
 
 
+def _sampled_betweenness(G, k, seed=42):
+    """``nx.betweenness_centrality(G, k=k, seed=seed)`` for an unweighted graph, faster.
+
+    It runs the same Brandes steps in the same order over integer-indexed adjacency
+    lists, so every score is bit-identical to networkx. It falls back to networkx
+    when the private rescale helper of networkx has another signature.
+    """
+    from networkx.algorithms.centrality.betweenness import _rescale
+
+    nodes = list(G)
+    n = len(nodes)
+    index = {node: i for i, node in enumerate(nodes)}
+    adjacency = [[index[w] for w in G[v]] for v in nodes]
+    sources = random.Random(seed).sample(nodes, k) if k is not None else nodes
+    scores = [0.0] * n
+    for source in sources:
+        s = index[source]
+        dist = [-1] * n
+        sigma = [0.0] * n
+        preds: list = [None] * n
+        dist[s] = 0
+        sigma[s] = 1.0
+        preds[s] = []
+        order = []
+        queue = deque([s])
+        while queue:
+            v = queue.popleft()
+            order.append(v)
+            next_dist = dist[v] + 1
+            sigma_v = sigma[v]
+            for w in adjacency[v]:
+                if dist[w] < 0:
+                    queue.append(w)
+                    dist[w] = next_dist
+                    preds[w] = []
+                if dist[w] == next_dist:
+                    sigma[w] += sigma_v
+                    preds[w].append(v)
+        delta = dict.fromkeys(order, 0)
+        while order:
+            w = order.pop()
+            coeff = (1 + delta[w]) / sigma[w]
+            for v in preds[w]:
+                delta[v] += sigma[v] * coeff
+            if w != s:
+                scores[w] += delta[w]
+    raw = dict(zip(nodes, scores))
+    try:
+        return _rescale(raw, n, normalized=True, directed=G.is_directed(), endpoints=False,
+                        sampled_nodes=None if k is None else sources)
+    except TypeError:
+        return nx.betweenness_centrality(G, k=k, seed=seed)
+
+
 def suggest_questions(
     G: nx.Graph,
     communities: dict[int, list[str]],
@@ -512,7 +568,7 @@ def suggest_questions(
     # 2. Bridge nodes (high betweenness) → cross-cutting concern questions
     if G.number_of_edges() > 0:
         k = min(100, G.number_of_nodes()) if G.number_of_nodes() > 1000 else None
-        betweenness = nx.betweenness_centrality(G, k=k, seed=42)
+        betweenness = _sampled_betweenness(G, k, seed=42)
         # Top bridge nodes that are NOT file-level hubs
         bridges = sorted(
             [(n, s) for n, s in betweenness.items()
