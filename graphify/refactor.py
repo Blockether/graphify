@@ -213,6 +213,8 @@ def _role(leaf) -> tuple[str, str | None] | None:
             key = parent.named_children[0]
         if key is not None and key.id == leaf.id:
             return None  # a parameter name, a field or a map key: not a reference
+    if parent is not None and parent.type == "literal_element" and _go_field_key(parent):
+        return "member", None  # Receipt{Order: o}: a struct field name, not a type or a variable
     if parent is not None and _FIELD.match(parent.type) and parent.child_by_field_name("name") == leaf:
         return "member", None
     if parent is not None and parent.type == "token_tree":
@@ -243,6 +245,17 @@ def _role(leaf) -> tuple[str, str | None] | None:
             role, receiver = "import", None  # use a::b::name
         node = node.parent
     return role, receiver
+
+
+def _go_field_key(element) -> bool:
+    """The key of a Go struct literal element. A map literal key is an expression."""
+    keyed = element.parent
+    if keyed is None or keyed.type != "keyed_element" or keyed.named_children[0].id != element.id:
+        return False
+    value = keyed.parent
+    literal = value.parent if value is not None else None
+    kind = literal.child_by_field_name("type") if literal is not None and literal.type == "composite_literal" else None
+    return kind is None or kind.type != "map_type"
 
 
 def _module_path(leaf) -> bool:
@@ -519,7 +532,8 @@ def _imports(scan: _Scan) -> list:
     while stack:
         n = stack.pop()
         if _IMPORT.search(n.type):
-            out.append(n)
+            specs = [s for c in n.children if c.type == "import_spec_list" for s in c.named_children if s.type == "import_spec"]
+            out.extend(specs or [n])  # each path of a Go import ( ... ) block is its own import
         elif n.child_count:
             stack.extend(n.children)
     scan.nodes = out
@@ -625,6 +639,22 @@ def _visible(owner: _Owner, aliases) -> set[str]:
     return out
 
 
+def _rust_path(leaf, scan: _Scan) -> str | None:
+    """The path of a Rust name such as ``crate::util::sum``, also inside a macro, or None."""
+    parent = leaf.parent
+    if parent is None or not scan.file.endswith(".rs"):
+        return None
+    if parent.type == "scoped_identifier":
+        return _path_text(parent, scan)
+    if parent.type != "token_tree":
+        return None
+    parts, n = [], leaf.prev_sibling
+    while n is not None and n.type == "::" and n.prev_sibling is not None and n.prev_sibling.type in ("identifier", "crate", "self", "super"):
+        parts.insert(0, n.prev_sibling.text.decode("utf-8", "replace"))
+        n = n.prev_sibling.prev_sibling
+    return "::".join([*parts, leaf.text.decode("utf-8", "replace")]) if parts else None  # println!("{}", util::sum(2))
+
+
 def _can_own(owner: _Owner, file: str, site: _Site, scan: _Scan, needle: bytes, aliases) -> bool:
     occ = site.occ
     if owner.module:
@@ -638,7 +668,10 @@ def _can_own(owner: _Owner, file: str, site: _Site, scan: _Scan, needle: bytes, 
     if owner.scope is not None and (file != owner.file or not owner.scope[0] <= occ.start < owner.scope[1]):
         return False
     inside = owner.klass is not None and file == owner.file and owner.klass[0] <= occ.start < owner.klass[1]
+    scoped = _rust_path(site.leaf, scan) if occ.role == "member" else None
     if owner.method:
+        if scoped is not None:
+            return site.receiver in owner.family | {owner.class_name} or (inside and site.receiver == "Self")  # Packet::sum
         if occ.role == "member":
             if inside and site.receiver in _SELF:
                 return True
@@ -662,7 +695,9 @@ def _can_own(owner: _Owner, file: str, site: _Site, scan: _Scan, needle: bytes, 
             return any(re.search(r"(?<![\w$])" + re.escape(c) + r"(?![\w$])", texts) for c in owner.family | {owner.class_name} if c)
         family = GRAMMARS.get(Path(file).suffix.lower(), (None,))[0]
         return inside and family in _IMPLICIT_THIS
-    if file not in owner.linked and not _visible(owner, aliases):
+    if scoped is not None:
+        return _named(scoped, owner)  # crate::util::name(..), super::name(..)
+    if file not in owner.linked and not _visible(owner, aliases) and not _same_package(owner, file):
         return False
     if file != owner.file:
         if occ.role == "import":
@@ -673,10 +708,13 @@ def _can_own(owner: _Owner, file: str, site: _Site, scan: _Scan, needle: bytes, 
         if not texts and occ.role != "member" and _family(file) in _NAMED_IMPORTS and not _star(scan, owner):
             return False  # a bare name from another file needs an import of it
     if occ.role == "member":
-        if site.receiver in ("super", "self") and file.endswith(".rs"):
-            return _named(_path_text(site.leaf.parent, scan), owner)  # super::name(..)
         return site.receiver in _visible(owner, aliases)
     return not _shadowed(site.leaf, needle, owner.decl)
+
+
+def _same_package(owner: _Owner, file: str) -> bool:
+    """A Go file in the folder of the definition: one package sees its names without an import."""
+    return file.endswith(".go") and owner.file.endswith(".go") and Path(file).parent == Path(owner.file).parent
 
 
 def _type_name(text: bytes) -> str | None:

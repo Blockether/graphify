@@ -113,6 +113,18 @@ def test_rust_rename_covers_use_and_paths(tmp_path):
     assert "grow(2) + util::grow(3)" in out["src/lib.rs"]
 
 
+def test_rust_rename_covers_full_paths_and_keeps_methods(tmp_path):
+    graph = _project(tmp_path, {
+        "Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n',
+        "src/util.rs": "pub fn sum(x: u32) -> u32 {\n    x\n}\n",
+        "src/packet.rs": "pub struct Packet;\n\nimpl Packet {\n    pub fn sum(&self) -> u32 {\n        crate::util::sum(1)\n    }\n}\n",
+        "src/main.rs": "mod packet;\nmod util;\n\nfn main() {\n    let p = packet::Packet;\n    println!(\"{}\", p.sum() + crate::util::sum(2));\n}\n",
+    })
+    out = _renamed(tmp_path, graph, "sum()", "src/util.rs", "total")
+    assert "crate::util::total(1)" in out["src/packet.rs"] and "pub fn sum(&self)" in out["src/packet.rs"]
+    assert "p.sum() + crate::util::total(2)" in out["src/main.rs"]
+
+
 def test_rust_trait_method_is_a_conflict(tmp_path):
     graph = _project(tmp_path, RUST)
     plan = plan_rename(graph, _node(graph, ".drop()", "src/util.rs"), "release", tmp_path)
@@ -135,6 +147,27 @@ def test_go_rename_covers_package_selectors_and_methods(tmp_path):
     out = _renamed(tmp_path, graph, "NewCart()", "shop/cart.go", "MakeCart")
     assert "func MakeCart() *Cart" in out["shop/cart.go"]
     assert "c := shop.MakeCart()" in out["main.go"]
+
+
+def test_go_type_rename_covers_its_package_and_skips_rivals(tmp_path):
+    graph = _project(tmp_path, {
+        "go.mod": "module example.com/app\n\ngo 1.22\n",
+        "shop/order.go": "package shop\n\ntype Order struct{ ID string }\n",
+        "shop/store.go": "package shop\n\nvar cache = map[string]*Order{}\n\nfunc Find(id string) Order { return *cache[id] }\n",
+        "audit/audit.go": "package audit\n\ntype Order struct{ Ref string }\n",
+        "bill/bill.go": (
+            "package bill\n\nimport (\n\t\"example.com/app/audit\"\n\t\"example.com/app/shop\"\n)\n\n"
+            "type Receipt struct{ Order shop.Order }\n\n"
+            "func Make() (Receipt, []shop.Order, audit.Order) {\n"
+            "\treturn Receipt{Order: shop.Order{ID: \"a\"}}, []shop.Order{{ID: \"b\"}}, audit.Order{Ref: \"c\"}\n}\n"
+        ),
+    })
+    out = _renamed(tmp_path, graph, "Order", "shop/order.go", "Purchase")
+    assert "map[string]*Purchase{}" in out["shop/store.go"] and "func Find(id string) Purchase" in out["shop/store.go"]
+    bill = out["bill/bill.go"]
+    assert "type Receipt struct{ Order shop.Purchase }" in bill  # the field keeps its name
+    assert 'Receipt{Order: shop.Purchase{ID: "a"}}, []shop.Purchase{{ID: "b"}}, audit.Order{Ref: "c"}' in bill
+    assert out["audit/audit.go"] == "package audit\n\ntype Order struct{ Ref string }\n"
 
 
 JAVA = {
