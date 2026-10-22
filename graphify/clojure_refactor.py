@@ -17,6 +17,8 @@ __all__ = ["Occurrence", "RenamePlan", "StaleFile", "apply_rename", "plan_rename
 
 # Characters that end a Clojure token. Anything else can be part of a symbol.
 _TOKEN = re.compile(rb"[^\s()\[\]{}\"\\;@^`~,]+")
+# Strings, comments and character literals: tokens inside them are text, not code.
+_TEXT = re.compile(rb'"(?:\\.|[^"\\])*"|;[^\n]*|\\.')
 _INVALID_NAME = re.compile(r"[\s()\[\]{}\"\\;@^`~,/]|^[:#'0-9]")
 _FACTORIES = ("->", "map->")
 
@@ -86,7 +88,8 @@ def _replacement(text: str, old: str, new: str) -> str | None:
 
 
 def _mentions(path: str, data: bytes, old: str, covered: set[int]) -> list[Mention]:
-    """Tokens that spell ``old`` (keywords, strings, quoted data) outside the edits."""
+    """Tokens that spell ``old`` outside the edits: code symbols, keywords, strings and quoted data."""
+    text = [(m.start(), m.end()) for m in _TEXT.finditer(data)]
     out = []
     for m in _TOKEN.finditer(data):
         token = m.group().decode("utf-8", "replace")
@@ -94,7 +97,8 @@ def _mentions(path: str, data: bytes, old: str, covered: set[int]) -> list[Menti
         if bare != old or any(m.start() <= c < m.end() for c in covered):
             continue
         line = data.count(b"\n", 0, m.start()) + 1
-        out.append(Mention(path, line, token))
+        data_like = token.startswith(":") or any(start <= m.start() < end for start, end in text)
+        out.append(Mention(path, line, token, "text" if data_like else "symbol"))
     return out
 
 

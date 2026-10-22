@@ -68,7 +68,7 @@ def test_python_method_follows_a_qualified_constructor(tmp_path):
 def test_plan_reports_mentions_and_refuses_stale_files(tmp_path):
     graph = _project(tmp_path, PYTHON)
     plan = plan_rename(graph, _node(graph, "helper()", "app/util.py"), "assist", tmp_path)
-    assert any("helper is the identity" in m.text for m in plan.mentions)
+    assert any("helper is the identity" in m.text and m.kind == "text" for m in plan.mentions)
     assert {Path(f).resolve().relative_to(tmp_path.resolve()).as_posix() for f in plan.files} == {"app/util.py", "app/main.py"}
     (tmp_path / "app/main.py").write_text("changed = 1\n", encoding="utf-8")
     with pytest.raises(StaleFile):

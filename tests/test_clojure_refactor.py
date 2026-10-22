@@ -129,8 +129,8 @@ def test_rename_rewrites_every_site_and_keeps_data(corpus):
     assert "(resolve 'app.util/assist)" in util
     other = corpus["other"].read_text()
     assert ":refer [assist] :rename {assist h}" in other and "(h 1)" in other
-    mentioned = {(Path(m.file).stem, m.text) for m in plan.mentions}
-    assert ("core", ":helper") in mentioned and ("util", "helper") in mentioned  # the docstring
+    mentioned = {(Path(m.file).stem, m.text, m.kind) for m in plan.mentions}
+    assert ("core", ":helper", "text") in mentioned and ("util", "helper", "text") in mentioned  # the docstring
 
 
 def test_rename_reports_conflicts(corpus):

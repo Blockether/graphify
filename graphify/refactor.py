@@ -85,11 +85,16 @@ class Edit:
 
 @dataclass(frozen=True)
 class Mention:
-    """Text that spells the name but is not a site of the node: strings, comments, other symbols."""
+    """Text that spells the name but is not a site of the node.
+
+    ``kind`` is ``symbol`` for code: another symbol, or a site that is not confirmed.
+    It is ``text`` for strings, comments, keywords and other data.
+    """
 
     file: str
     line: int
     text: str
+    kind: str = "text"
 
 
 @dataclass(frozen=True)
@@ -883,7 +888,7 @@ def _split(scans: dict[str, _Scan], owners: list[_Owner], name: str) -> tuple[li
                 own.append(Occurrence(occ.file, occ.line, occ.col, occ.start, occ.end, role, occ.text, occ.qualified))
             else:
                 why = "another symbol" if able else "unconfirmed"
-                other.append(Mention(file, occ.line, f"{name} ({why})"))
+                other.append(Mention(file, occ.line, f"{name} ({why})", "symbol"))
                 if common and not able and occ.role == "member" and _anchored(target, file, site) and _receiver_type(site, scan) is None:
                     target.unsure.append(other[-1])
     own.sort(key=lambda o: (o.file, o.start))
