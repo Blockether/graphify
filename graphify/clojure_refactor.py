@@ -7,78 +7,18 @@ defines the name wins. Locals, quoted data, strings and keywords never match.
 """
 from __future__ import annotations
 
-import hashlib
 import re
-from dataclasses import dataclass, field
 from pathlib import Path
 
 from graphify.extractors.clojure import CLOJURE_SUFFIXES, extract_clojure
+from graphify.refactor import Edit, Mention, Occurrence, RenamePlan, StaleFile, apply_rename, digest, rewrite
+
+__all__ = ["Occurrence", "RenamePlan", "StaleFile", "apply_rename", "plan_rename", "references", "rewrite"]
 
 # Characters that end a Clojure token. Anything else can be part of a symbol.
 _TOKEN = re.compile(rb"[^\s()\[\]{}\"\\;@^`~,]+")
 _INVALID_NAME = re.compile(r"[\s()\[\]{}\"\\;@^`~,/]|^[:#'0-9]")
 _FACTORIES = ("->", "map->")
-
-
-@dataclass(frozen=True)
-class Occurrence:
-    """One site that names the var: a use, its definition or a namespace refer."""
-
-    file: str
-    line: int
-    col: int
-    start: int
-    end: int
-    role: str
-    text: str
-    qualified: bool
-
-
-@dataclass(frozen=True)
-class Edit:
-    """One replacement of the name range ``start:end`` in ``file``."""
-
-    file: str
-    line: int
-    col: int
-    start: int
-    end: int
-    old: str
-    new: str
-
-
-@dataclass(frozen=True)
-class Mention:
-    """Text that spells the name but does not resolve to the var."""
-
-    file: str
-    line: int
-    text: str
-
-
-@dataclass(frozen=True)
-class RenamePlan:
-    """The edits of one var rename, and why it is not safe when it is not."""
-
-    ns: str
-    old: str
-    new: str
-    edits: tuple[Edit, ...]
-    conflicts: tuple[str, ...]
-    mentions: tuple[Mention, ...]
-    digests: dict = field(default_factory=dict)
-
-    @property
-    def files(self) -> tuple[str, ...]:
-        return tuple(sorted({e.file for e in self.edits}))
-
-
-class StaleFile(RuntimeError):
-    """A planned file changed on disk before the rename was applied."""
-
-
-def _digest(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
 
 
 def _scan(name: str, files) -> dict[str, tuple[bytes, dict]]:
@@ -199,35 +139,5 @@ def plan_rename(ns: str, old: str, new: str, files) -> RenamePlan:
     for path, (data, _) in sorted(parsed.items()):
         covered = {e.start for e in edits if e.file == path}
         mentions.extend(_mentions(path, data, old, covered))
-    digests = {path: _digest(parsed[path][0]) for path in {e.file for e in edits}}
-    return RenamePlan(ns, old, new, tuple(edits), tuple(conflicts), tuple(mentions), digests)
-
-
-def rewrite(plan: RenamePlan) -> dict[str, tuple[bytes, bytes]]:
-    """The old and new bytes of each planned file, without writes.
-
-    Raises ``StaleFile`` when a file changed after the plan.
-    """
-    by_file: dict[str, list[Edit]] = {}
-    for e in plan.edits:
-        by_file.setdefault(e.file, []).append(e)
-    out: dict[str, tuple[bytes, bytes]] = {}
-    for path in sorted(by_file):
-        data = Path(path).read_bytes()
-        if _digest(data) != plan.digests.get(path):
-            raise StaleFile(f"{path} changed after the rename plan. Plan the rename again.")
-        new = data
-        for e in sorted(by_file[path], key=lambda e: e.start, reverse=True):
-            new = new[:e.start] + e.new.encode("utf-8") + new[e.end:]
-        out[path] = (data, new)
-    return out
-
-
-def apply_rename(plan: RenamePlan) -> list[str]:
-    """Write the edits of a conflict-free plan. Refuse a file that changed since the plan."""
-    if plan.conflicts:
-        raise ValueError("The rename plan has conflicts: " + " ".join(plan.conflicts))
-    contents = rewrite(plan)
-    for path, (_, new) in contents.items():
-        Path(path).write_bytes(new)
-    return sorted(contents)
+    digests = {path: digest(parsed[path][0]) for path in {e.file for e in edits}}
+    return RenamePlan(f"{ns}/{old}", old, new, tuple(edits), tuple(conflicts), tuple(mentions), digests)
