@@ -76,9 +76,12 @@ def _lib_stub_id(lib: str) -> str:
     return _make_id("clojure_lib", lib.replace(".", "_dot_").replace("/", "_slash_"))
 
 
-def extract_clojure(path: Path) -> dict:
+def extract_clojure(path: Path, positions: bool = False) -> dict:
     """Extract namespaces, vars, macros, protocols, records, multimethods,
-    specs, tests, imports and calls from a Clojure source or EDN file."""
+    specs, tests, imports and calls from a Clojure source or EDN file.
+
+    With ``positions``, the ``clojure`` block also lists every resolved symbol
+    occurrence with its byte range, for exact references and renames."""
     try:
         import tree_sitter_clojure as tsclj
         from tree_sitter import Language, Parser
@@ -115,6 +118,10 @@ def extract_clojure(path: Path) -> dict:
     bodies: list[tuple[str, list, frozenset]] = []  # (owner nid, forms, shadowed names)
     refs: list[dict] = []               # cross-file references for the corpus pass
     import_stubs: dict[str, str] = {}   # stub id -> namespace
+    refer_names: dict[str, str] = {}    # :rename local name -> original var name
+    occurrences: list[dict] = []        # positions mode: resolved symbol sites
+    unresolved: set[str] = set()        # positions mode: unqualified names bound nowhere
+    record_only = False                 # positions mode: inside a (comment ...) form
 
     def _text(node) -> str:
         return source[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
@@ -263,6 +270,25 @@ def extract_clojure(path: Path) -> dict:
                     _binding_names(val, out)
                     continue
             _binding_names(key, out)
+
+    def _walk_defaults(node, owner: str, shadow: frozenset) -> None:
+        """Walk the `:or` default expressions of a destructuring form."""
+        if node is None:
+            return
+        if node.type == "vec_lit":
+            for child in _values(node):
+                _walk_defaults(child, owner, shadow)
+            return
+        if node.type != "map_lit":
+            return
+        vals = _values(node)
+        for i in range(0, len(vals) - 1, 2):
+            key, val = vals[i], vals[i + 1]
+            if key.type != "kwd_lit":
+                _walk_defaults(key, owner, shadow)  # nested destructuring: {{:keys [a]} :b}
+            elif _kwd_name(key) == "or" and val.type == "map_lit":
+                for default in _values(val)[1::2]:
+                    _walk_refs(default, owner, shadow)
     def _walk_binding_inits(vec, owner: str, shadow: frozenset) -> frozenset:
         """Walk the init expressions of a binding vector in order and return the
         scope after it. Each init sees the names bound before it."""
@@ -279,35 +305,70 @@ def extract_clojure(path: Path) -> dict:
             bound: set[str] = set()
             _binding_names(target, bound)
             shadow = shadow | frozenset(bound)
+            _walk_defaults(target, owner, shadow)
         return shadow
 
     # ── reference resolution ────────────────────────────────────────────────
-    def _resolve_ref(owner: str, sym, relation: str, line: int, shadow: frozenset) -> None:
+    def _where(sym, shadow: frozenset) -> tuple[bool, list, str] | None:
+        """Resolve a symbol to (defined in this file, candidate namespaces, var name)."""
         ns_part, name = sym
         if name.startswith(".") or name == "new" or name.isdigit():
-            return  # 1.12 method values (String/.length, Integer/new) and array classes
+            return None  # 1.12 method values (String/.length, Integer/new) and array classes
         if ns_part:
             target_ns = aliases.get(ns_part, ns_part)
             if current_ns and target_ns == current_ns and name in defs:
-                add_edge(owner, defs[name], relation, line)
-                return
+                return True, [current_ns], name
             if "." not in target_ns and target_ns not in aliases.values():
-                return  # Java static (Math/PI) or an unknown alias
-            refs.append({"caller": owner, "ns": [target_ns], "name": name,
-                         "relation": relation, "line": line})
-            return
+                return None  # Java static (Math/PI) or an unknown alias
+            return False, [target_ns], name
         if name in shadow:
-            return
+            return None
         if name in defs:
+            return True, [current_ns], name
+        if name in refers:
+            return False, [refers[name]], refer_names.get(name, name)
+        if refer_all:
+            return False, list(refer_all), name
+        unresolved.add(name)
+        return None
+
+    def _occur(node, nss: list, name: str, role: str, local: bool = False,
+               shadow: frozenset = frozenset()) -> None:
+        """Record the name range of a resolved symbol in positions mode."""
+        if not positions or node is None or node.type != "sym_lit":
+            return
+        name_node = node.child_by_field_name("name")
+        if name_node is None:
+            return
+        occurrences.append({
+            "ns": list(nss), "name": name, "text": _text(name_node),
+            "start": name_node.start_byte, "end": name_node.end_byte,
+            "line": name_node.start_point[0] + 1, "col": name_node.start_point[1] + 1,
+            "role": "comment" if record_only else role,
+            "qualified": node.child_by_field_name("namespace") is not None,
+            "local": local, "shadow": sorted(shadow),
+        })
+
+    def _occur_sym(node, sym, role: str, name: str | None = None) -> None:
+        """Record a site that names a var outside a body walk (defmethod, impls)."""
+        found = _where(sym, frozenset()) if positions and sym else None
+        if found:
+            _occur(node, found[1], name or found[2], role, local=found[0])
+
+    def _resolve_ref(owner: str, sym, relation: str, line: int, shadow: frozenset,
+                     node=None) -> None:
+        found = _where(sym, shadow)
+        if found is None:
+            return
+        local, nss, name = found
+        _occur(node, nss, name, "use", local=local, shadow=shadow)
+        if record_only:
+            return
+        if local:
             add_edge(owner, defs[name], relation, line)
             return
-        if name in refers:
-            refs.append({"caller": owner, "ns": [refers[name]], "name": name,
-                         "relation": relation, "line": line})
-            return
-        if refer_all:
-            refs.append({"caller": owner, "ns": list(refer_all), "name": name,
-                         "relation": relation, "line": line})
+        refs.append({"caller": owner, "ns": nss, "name": name,
+                     "relation": relation, "line": line})
 
     def _walk_refs(node, owner: str, shadow: frozenset) -> None:
         t = node.type
@@ -319,7 +380,7 @@ def extract_clojure(path: Path) -> dict:
         if t == "sym_lit":
             s = _sym(node)
             if s:
-                _resolve_ref(owner, s, "references", _line(node), shadow)
+                _resolve_ref(owner, s, "references", _line(node), shadow, node)
             return
         if t == "list_lit":
             vals = _values(node)
@@ -329,6 +390,7 @@ def extract_clojure(path: Path) -> dict:
             if head and not head[0]:
                 hname = head[1]
                 if hname == "comment" and hname not in defs:
+                    _walk_comment(vals[1:], owner, shadow)
                     return
                 if hname in ("quote",):
                     return
@@ -359,7 +421,7 @@ def extract_clojure(path: Path) -> dict:
                     for k, item in enumerate(_values(vals[1])):
                         target = _sym(item) if k % 2 == 0 and item.type == "sym_lit" else None
                         if target:
-                            _resolve_ref(owner, target, "references", _line(item), shadow)
+                            _resolve_ref(owner, target, "references", _line(item), shadow, item)
                         else:
                             _walk_refs(item, owner, shadow)
                     for v in vals[2:]:
@@ -371,15 +433,16 @@ def extract_clojure(path: Path) -> dict:
                         named = _sym(quoted[0]) if quoted and quoted[0].type == "sym_lit" else None
                         if named:
                             # A quoted symbol ignores locals, so no shadowing applies.
-                            _resolve_ref(owner, named, "references", _line(quoted[0]), frozenset())
+                            _resolve_ref(owner, named, "references", _line(quoted[0]), frozenset(),
+                                         quoted[0])
             if head:
-                _resolve_ref(owner, head, "calls", _line(vals[0]), shadow)
+                _resolve_ref(owner, head, "calls", _line(vals[0]), shadow, vals[0])
             elif vals[0].type == "var_quoting_lit":
                 # (#'my.ns/f x) calls the var directly.
                 for v in _values(vals[0]):
                     called = _sym(v) if v.type == "sym_lit" else None
                     if called:
-                        _resolve_ref(owner, called, "calls", _line(v), shadow)
+                        _resolve_ref(owner, called, "calls", _line(v), shadow, v)
             else:
                 # A computed head such as ((comp f g) x) still references code.
                 _walk_refs(vals[0], owner, shadow)
@@ -404,10 +467,22 @@ def extract_clojure(path: Path) -> dict:
                 if v.type == "sym_lit":
                     s = _sym(v)
                     if s:
-                        _resolve_ref(owner, s, "references", _line(v), shadow)
+                        _resolve_ref(owner, s, "references", _line(v), shadow, v)
             return
         for child in node.children:
             _walk_refs(child, owner, shadow)
+
+    def _walk_comment(forms: list, owner: str, shadow: frozenset) -> None:
+        """Record sites inside a rich (comment ...) form, without graph edges."""
+        nonlocal record_only
+        if not positions or record_only:
+            return
+        record_only = True
+        try:
+            for f in forms:
+                _walk_refs(f, owner, shadow)
+        finally:
+            record_only = False
 
     def _walk_fn(rest: list, owner: str, shadow: frozenset) -> None:
         """Walk `[name?] [params] body...` or `[name?] ([params] body...)+`."""
@@ -427,10 +502,12 @@ def extract_clojure(path: Path) -> dict:
         if not vals:
             return
         bound: set[str] = set()
-        if vals[0].type == "vec_lit":
-            _binding_names(vals[0], bound)
+        params = vals[0] if vals[0].type == "vec_lit" else None
+        if params is not None:
+            _binding_names(params, bound)
             vals = vals[1:]
         inner = shadow | frozenset(bound)
+        _walk_defaults(params, owner, inner)
         for v in vals:
             _walk_refs(v, owner, inner)
 
@@ -520,12 +597,15 @@ def extract_clojure(path: Path) -> dict:
                         s = _sym(r)
                         if s:
                             refers[s[1]] = lib
+                            _occur(r, [lib], s[1], "refer")
             elif key == "rename" and val is not None and val.type == "map_lit":
                 pairs = _values(val)
                 for j in range(0, len(pairs) - 1, 2):
                     a, b = _sym(pairs[j]), _sym(pairs[j + 1])
                     if a and b:
                         refers[b[1]] = lib
+                        refer_names[b[1]] = a[1]
+                        _occur(pairs[j], [lib], a[1], "refer")
             elif key == "default" and val is not None and val.type == "sym_lit":
                 aliases[_sym(val)[1]] = lib
             elif opts[i - 2].type != "kwd_lit":
@@ -591,9 +671,10 @@ def extract_clojure(path: Path) -> dict:
     def _contain(nid: str, line: int, relation: str = "contains") -> None:
         add_edge(_owner(), nid, relation, line)
 
-    def _register(name: str, nid: str, label: str, line: int) -> None:
+    def _register(name: str, nid: str, label: str, line: int, name_node=None) -> None:
         add_node(nid, label, line)
         defs.setdefault(name, nid)
+        _occur(name_node, [current_ns], name, "definition", local=True)
         _contain(nid, line)
 
     def _after_name(vals: list, idx: int) -> tuple[list, object | None]:
@@ -616,7 +697,7 @@ def extract_clojure(path: Path) -> dict:
             label = f"{name} (macro)"
         else:
             label = f"{name}()"
-        _register(name, nid, label, _line(node))
+        _register(name, nid, label, _line(node), vals[1])
         rest, doc = _after_name(vals, 1)
         if doc is not None:
             _docstring(doc, nid)
@@ -628,7 +709,7 @@ def extract_clojure(path: Path) -> dict:
             return
         name = name_sym[1]
         nid = _cj_id(stem, name)
-        _register(name, nid, name, _line(node))
+        _register(name, nid, name, _line(node), vals[1])
         rest = vals[2:]
         if len(rest) == 2 and rest[0].type == "str_lit":
             _docstring(rest[0], nid)
@@ -641,7 +722,7 @@ def extract_clojure(path: Path) -> dict:
             return
         name = name_sym[1]
         nid = _cj_id(stem, name)
-        _register(name, nid, f"{name} (multimethod)", _line(node))
+        _register(name, nid, f"{name} (multimethod)", _line(node), vals[1])
         rest, doc = _after_name(vals, 1)
         if doc is not None:
             _docstring(doc, nid)
@@ -657,6 +738,7 @@ def extract_clojure(path: Path) -> dict:
         add_node(nid, f"{name} {dispatch}"[:80], _line(node))
         _contain(nid, _line(node))
         _pending_impl.append((nid, multi, _line(node)))
+        _occur_sym(vals[1], multi, "implementation")
         bodies.append((nid, ["fn", vals[3:]], frozenset()))
 
     def _handle_defprotocol(node, vals: list) -> None:
@@ -665,7 +747,7 @@ def extract_clojure(path: Path) -> dict:
             return
         name = name_sym[1]
         nid = _cj_id(stem, name)
-        _register(name, nid, name, _line(node))
+        _register(name, nid, name, _line(node), vals[1])
         rest = vals[2:]
         if rest and rest[0].type == "str_lit":
             _docstring(rest[0], nid)
@@ -679,6 +761,7 @@ def extract_clojure(path: Path) -> dict:
             mnid = _cj_id(stem, name, msym[1])
             add_node(mnid, f".{msym[1]}()", _line(sig))
             defs.setdefault(msym[1], mnid)
+            _occur(sv[0], [current_ns], msym[1], "definition", local=True)
             add_edge(nid, mnid, "method", _line(sig))
             for d in sv[1:]:
                 if d.type == "str_lit":
@@ -704,6 +787,7 @@ def extract_clojure(path: Path) -> dict:
                     if pns is None and proto[1] not in defs:
                         pns = refers.get(proto[1])
                     _pending_impl.append((mnid, (pns, msym[1]), _line(item)))
+                    _occur_sym(iv[0], proto, "implementation", msym[1])
                 bodies.append((mnid, ["fn", iv[1:]], shadow))
 
     def _handle_type_def(node, vals: list, kind: str) -> None:
@@ -712,7 +796,7 @@ def extract_clojure(path: Path) -> dict:
             return
         name = name_sym[1]
         nid = _cj_id(stem, name)
-        _register(name, nid, name, _line(node))
+        _register(name, nid, name, _line(node), vals[1])
         fields: set[str] = set()
         rest = vals[2:]
         if rest and rest[0].type == "vec_lit":
@@ -757,6 +841,7 @@ def extract_clojure(path: Path) -> dict:
                 add_node(mnid, f".{msym[1]}()", _line(item))
                 add_edge(parent, mnid, "method", _line(item))
                 _pending_impl.append((mnid, (proto[0], msym[1]), _line(item)))
+                _occur_sym(iv[0], proto, "implementation", msym[1])
                 bodies.append((mnid, ["fn", iv[1:]], frozenset()))
 
     def _handle_spec(node, vals: list, kind: str) -> None:
@@ -791,7 +876,7 @@ def extract_clojure(path: Path) -> dict:
             label = f"{name}()"
         else:
             label = name
-        _register(name, nid, label, _line(node))
+        _register(name, nid, label, _line(node), vals[1])
         if doc is not None:
             _docstring(doc, nid)
         if rest and rest[0].type == "vec_lit":
@@ -893,7 +978,7 @@ def extract_clojure(path: Path) -> dict:
             for spec in _flatten_conditionals(vals[1:]):
                 _java_import(spec, _line(form))
         elif h == "comment":
-            return
+            _comments.append(vals[1:])
         elif h in _FN_DEFINERS or h in _MACRO_DEFINERS:
             _handle_fn_def(form, vals, h)
         elif h in _DATA_DEFINERS:
@@ -911,7 +996,10 @@ def extract_clojure(path: Path) -> dict:
         elif h == "defproject":
             _handle_defproject(form, vals)
         elif h == "declare":
-            return
+            for v in vals[1:]:
+                s = _sym(v)
+                if s and not s[0]:
+                    _occur(v, [current_ns], s[1], "declaration", local=True)
         elif h.startswith("def") and h not in _NOT_DEFINERS:
             _handle_custom_def(form, vals, h)
         elif any(v.type in ("list_lit", "read_cond_lit") and _contains_def(v) for v in vals[1:]):
@@ -934,6 +1022,7 @@ def extract_clojure(path: Path) -> dict:
         return any(_contains_def(v) for v in vals[1:])
 
     _toplevel: list = []
+    _comments: list = []
 
     if suffix == ".edn":
         for form in _root_forms(root):
@@ -952,6 +1041,8 @@ def extract_clojure(path: Path) -> dict:
                     _walk_refs(f, owner, shadow)
         for form in _toplevel:
             _walk_refs(form, _owner(), frozenset())
+        for forms in _comments:
+            _walk_comment(forms, _owner(), frozenset())
 
         # Implementations: defmethod -> defmulti, record -> protocol, impl -> protocol method.
         for impl_nid, target, line in _pending_impl:
@@ -975,7 +1066,9 @@ def extract_clojure(path: Path) -> dict:
                              "relation": "implements", "line": line})
 
     if current_ns:
-        def_names = {nid: name for name, nid in defs.items()}
+        def_names: dict[str, str] = {}
+        for name, nid in defs.items():
+            def_names.setdefault(nid, name)  # a record's own name, not its ->Rec factory
         for n in nodes:
             if n["id"] == ns_nid:
                 n["metadata"] = {"language": "clojure", "kind": "namespace", "module": current_ns}
@@ -992,6 +1085,13 @@ def extract_clojure(path: Path) -> dict:
         "refs": refs,
         "import_stubs": sorted([nid, ns] for nid, ns in import_stubs.items()),
     }
+    if positions:
+        primary: dict[str, str] = {}
+        for name, nid in defs.items():
+            primary.setdefault(nid, name)
+        result["clojure"]["occurrences"] = occurrences
+        result["clojure"]["unresolved"] = sorted(unresolved)
+        result["clojure"]["vars"] = {name: primary[nid] for name, nid in defs.items()}
     return result
 
 

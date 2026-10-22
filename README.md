@@ -6,7 +6,7 @@
   <a href="https://trendshift.io/repositories/25296?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-25296" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/25296" alt="Graphify-Labs%2Fgraphify | Trendshift" width="250" height="55"/></a>
 </p>
 
-> **Blockether fork.** This fork adds full Clojure support (`.clj`, `.cljs`, `.cljc`, `.bb`, `deps.edn`, `project.clj`) through [Blockether/tree-sitter-clojure](https://github.com/Blockether/tree-sitter-clojure), including Clojure 1.12 and 1.13 syntax. Namespaces, vars, macros, protocols, records, multimethods, specs and tests become nodes, and calls resolve across namespaces. `graphify domain` maps framework flows (commands, queries, events and their Malli schemas) through plugins; see [Domain flows](#domain-flows-blockether-fork). Install it with `uv tool install "graphifyy @ git+https://github.com/Blockether/graphify@v0.9.93-blockether.3"` (a C compiler builds the grammar).
+> **Blockether fork.** This fork adds full Clojure support (`.clj`, `.cljs`, `.cljc`, `.bb`, `deps.edn`, `project.clj`) through [Blockether/tree-sitter-clojure](https://github.com/Blockether/tree-sitter-clojure), including Clojure 1.12 and 1.13 syntax. Namespaces, vars, macros, protocols, records, multimethods, specs and tests become nodes, and calls resolve across namespaces. `graphify domain` maps framework flows (commands, queries, events and their Malli schemas) through plugins; see [Domain flows](#domain-flows-blockether-fork). `graphify.clojure_refactor` finds exact references and renames vars; see [Clojure references and renames](#clojure-references-and-renames-blockether-fork). Install it with `uv tool install "graphifyy @ git+https://github.com/Blockether/graphify@v0.9.93-blockether.4"` (a C compiler builds the grammar).
 
 <div align="center">
 <details><summary><b>Read this in other languages</b></summary>
@@ -338,6 +338,29 @@ Both encourage scoped graph queries before broad source searches. Choose the ins
 `graphify domain .` reads the commands, queries, events and effects that your Clojure services register, and connects them across services. It writes `graphify-out/domain/DOMAIN.md` with Mermaid flowcharts, sequence diagrams and findings, `domain.json`, and one JSON Schema for each Malli schema. It reports calls to commands or queries that no service registers. `graphify update .` adds the same elements to the graph.
 
 The built-in `edd-core` plugin reads [edd-core](https://github.com/alpha-prosoft/edd-core) services. Add a plugin for another framework as a Python file in `.graphify/plugins/`, as a package entry point or with `GRAPHIFY_PLUGINS`. Guide: **[Domain flows](docs/domain.md)**.
+
+## Clojure references and renames (Blockether fork)
+
+Use `graphify.clojure_refactor` when you rename a Clojure var or need every place that uses it. Plain text search also finds locals, keywords and strings with the same name. This module uses the same resolution as the graph:
+
+- Namespace aliases, `:refer`, `:refer :all` and `:rename` resolve the name.
+- Parameters, `let`, `letfn` and destructuring bindings shadow the var.
+- Definitions, `declare`, `defmethod`, protocol implementations, `#'var`, `resolve`, syntax-quote and rich `(comment ...)` forms count as sites.
+- A record rename also renames its `->Rec` and `map->Rec` factories.
+
+```python
+from pathlib import Path
+from graphify.clojure_refactor import apply_rename, plan_rename, references
+
+files = list(Path("src").rglob("*.clj"))
+sites = references("app.util", "helper", files)         # exact file, line and column of each site
+plan = plan_rename("app.util", "helper", "assist", files)
+print(plan.conflicts, len(plan.edits), plan.mentions)  # mentions: strings and keywords that stay
+if not plan.conflicts:
+    apply_rename(plan)                                  # refuses a file that changed after the plan
+```
+
+`plan_rename` writes nothing. Its conflicts name an invalid name, a var that already has the new name, or a file where the new unqualified name binds to a local, to another var or to `clojure.core`. Then run `graphify update .` to update the graph.
 
 ---
 

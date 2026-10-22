@@ -323,7 +323,8 @@ def test_clojure_1_13_select_and_status_directives(tmp_path):
   (sel) (defs) (everything) (extra) (gone) x)
 """
     r = extract_clojure(_write(tmp_path, "select.clj", src))
-    assert not _targets(r, "directives()", "calls")
+    # Directives bind names, but an `:or` default is a real call.
+    assert _targets(r, "directives()", "calls") == {"fallback()"}
 
 
 def test_clojure_1_13_key_binding_pairs(tmp_path):
@@ -486,3 +487,16 @@ def test_redefs_var_quote_heads_and_resolve_reference_vars(tmp_path):
     assert "p()" in _targets(r, "t3()", "calls")
     assert "r()" in _targets(r, "t4()", "references")
     assert "s()" in _targets(r, "t5()", "references")
+
+def test_or_defaults_reference_vars(tmp_path):
+    # Found by the rename check on vis/src: `:or` default expressions were never walked.
+    r = extract_clojure(_write(tmp_path, "or_defaults.clj", """\
+(ns demo.or-defaults)
+(defn now [] 1)
+(defn clock [{:keys [at] :or {at (now)}}] at)
+(defn local [{:keys [now] :or {now 0}}] (let [{:keys [x] :or {x (now)}} {}] x))
+(defn later [] (let [[{:keys [t] :or {t (now)}}] []] t))
+"""))
+    assert "now()" in _targets(r, "clock()", "calls")
+    assert "now()" in _targets(r, "later()", "calls")
+    assert "now()" not in _targets(r, "local()", "calls")  # the default calls the local `now`
