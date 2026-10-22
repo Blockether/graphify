@@ -989,6 +989,18 @@ def _import_js(node, source: bytes, file_nid: str, stem: str, edges: list, str_p
                 edge["target_file"] = str(resolved_path)
             if is_type_only:
                 edge["type_only"] = True
+            namespace = next(
+                (ident for clause in node.children
+                 if clause.type in ("import_clause", "import_require_clause")
+                 for sub in (clause, *clause.children)
+                 if sub.type in ("namespace_import", "import_require_clause")
+                 for ident in sub.children if ident.type == "identifier"),
+                None,
+            )
+            if namespace is not None:
+                # `import * as ns from './m'` and `import ns = require('./m')` bind `ns`
+                # to the module; `_resolve_typescript_namespace_calls` maps `ns.fn()`.
+                edge["local_alias"] = _read_text(namespace, source)
             edges.append(edge)
 
     # Emit symbol-level edges for named imports/re-exports from local/aliased files.
@@ -5352,6 +5364,68 @@ def _resolve_typescript_member_calls(
         })
 
 
+def _resolve_typescript_namespace_calls(
+    per_file: list[dict],
+    all_nodes: list[dict],
+    all_edges: list[dict],
+) -> None:
+    """Resolve `ns.fn()` through a namespace import: `import * as ns from './m'`.
+
+    The import edge carries the local name `ns` as ``local_alias``. The call goes to
+    the one symbol named `fn` that module `m` contains. The receiver must be bound by
+    an import of the caller's own file, so a local object of the same name is never
+    matched. No module or several candidate symbols emit nothing.
+    """
+    modules_by_alias: dict[tuple[str, str], set[str]] = {}
+    for e in all_edges:
+        alias = e.get("local_alias")
+        if (e.get("relation") == "imports_from" and alias
+                and _lang_family(e.get("source_file")) == "jsts"):
+            modules_by_alias.setdefault((str(e.get("source")), str(alias)), set()).add(str(e.get("target")))
+    if not modules_by_alias:
+        return
+    node_by_id = {n.get("id"): n for n in all_nodes}
+    file_of_node: dict[str, str] = {}
+    symbols: dict[tuple[str, str], list[str]] = {}
+    for e in all_edges:
+        if e.get("relation") == "contains":
+            src, tgt = str(e.get("source")), str(e.get("target"))
+            file_of_node[tgt] = src
+            label = str(node_by_id.get(tgt, {}).get("label", "")).removesuffix("()").lstrip(".")
+            symbols.setdefault((src, label), []).append(tgt)
+    for e in all_edges:
+        if e.get("relation") == "method":
+            owner_file = file_of_node.get(str(e.get("source")))
+            if owner_file is not None:
+                file_of_node.setdefault(str(e.get("target")), owner_file)
+    existing_pairs = {(e.get("source"), e.get("target")) for e in all_edges}
+    for result in per_file:
+        for rc in result.get("raw_calls", []):
+            if not rc.get("is_member_call") or rc.get("ts_this_field"):
+                continue
+            receiver, callee, caller = rc.get("receiver"), rc.get("callee"), rc.get("caller_nid")
+            if not receiver or not callee or not caller:
+                continue
+            modules = modules_by_alias.get((file_of_node.get(caller, ""), str(receiver)), set())
+            if len(modules) != 1:
+                continue
+            targets = symbols.get((next(iter(modules)), str(callee)), [])
+            if len(targets) != 1 or targets[0] == caller or (caller, targets[0]) in existing_pairs:
+                continue
+            existing_pairs.add((caller, targets[0]))
+            all_edges.append({
+                "source": caller,
+                "target": targets[0],
+                "relation": "calls",
+                "context": "call",
+                "confidence": "EXTRACTED",
+                "confidence_score": 1.0,
+                "source_file": rc.get("source_file", ""),
+                "source_location": rc.get("source_location"),
+                "weight": 1.0,
+            })
+
+
 def _resolve_cpp_member_calls(
     per_file: list[dict],
     all_nodes: list[dict],
@@ -7426,6 +7500,10 @@ register_language_resolver(
 register_language_resolver(
     LanguageResolver("typescript_member_calls", frozenset(_JS_TS_SUFFIXES),
                      _resolve_typescript_member_calls)
+)
+register_language_resolver(
+    LanguageResolver("typescript_namespace_calls", frozenset(_JS_TS_SUFFIXES),
+                     _resolve_typescript_namespace_calls)
 )
 # C++ (#1547) and ObjC (#1556) receiver-typed member-call resolution. `.h` is in
 # both suffix sets because it routes to extract_cpp or extract_objc by content; the
