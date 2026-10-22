@@ -3,6 +3,10 @@
 A :class:`Corpus` reads each Clojure file once. It records the namespace, the
 ``:require`` aliases and refers, and every top-level definition, so that a
 plugin can resolve a symbol to its definition in any file of the project.
+
+The top-level forms and the definition index are read on first use. A plugin
+that detects its framework from the ``ns`` forms alone then costs no full read
+on a project that it does not apply to.
 """
 
 from __future__ import annotations
@@ -53,9 +57,26 @@ class SourceFile:
     ns: str | None
     aliases: dict[str, str] = field(default_factory=dict)
     refers: dict[str, str] = field(default_factory=dict)
-    forms: list[Form] = field(default_factory=list)
     is_test: bool = False
     error: str | None = None
+    _forms: list[Form] | None = field(default=None, repr=False, compare=False)
+    _pending: tuple | None = field(default=None, repr=False, compare=False)
+
+    @property
+    def forms(self) -> list[Form]:
+        """The top-level forms of the file, read on first use."""
+        if self._forms is None:
+            self._forms = []
+            if self._pending is not None:
+                source, nodes = self._pending
+                self._pending = None
+                reader = edn.Reader(source, self.ns, self.aliases)
+                self._forms = [f for f in (reader.read(n) for n in nodes) if f is not None]
+        return self._forms
+
+    @forms.setter
+    def forms(self, forms: list[Form]) -> None:
+        self._forms, self._pending = forms, None
 
     def requires(self, namespace: str) -> bool:
         return namespace in self.aliases.values() or namespace in self.refers.values() or namespace in self.required
@@ -127,8 +148,7 @@ def read_file(path: Path, root: Path) -> SourceFile:
         if f is not None and f.kind == edn.LIST and f.head is not None and f.head.is_sym("ns"):
             _parse_ns(f, sf)
             break
-    reader = edn.Reader(source, sf.ns, sf.aliases)
-    sf.forms = [f for f in (reader.read(n) for n in nodes) if f is not None]
+    sf._pending = (source, nodes)
     return sf
 
 
@@ -147,12 +167,20 @@ class Corpus:
         self.root = root
         self.files = files
         self.by_ns: dict[str, SourceFile] = {}
-        self.definitions: dict[str, Definition] = {}
+        self._definitions: dict[str, Definition] | None = None
         for sf in files:
             if sf.ns:
                 self.by_ns.setdefault(sf.ns, sf)
-            for form in sf.forms:
-                self._index(form, sf)
+
+    @property
+    def definitions(self) -> dict[str, Definition]:
+        """Every top-level definition by qualified name, indexed on first use."""
+        if self._definitions is None:
+            self._definitions = {}
+            for sf in self.files:
+                for form in sf.forms:
+                    self._index(form, sf)
+        return self._definitions
 
     @classmethod
     def load(cls, root: str | Path, paths: Iterable[str | Path] | None = None) -> "Corpus":
@@ -176,7 +204,7 @@ class Corpus:
             return
         name = str(name_form.value)
         qualified = f"{sf.ns}/{name}" if sf.ns else name
-        self.definitions.setdefault(qualified, Definition(qualified, name, str(head.value), form, sf))
+        self._definitions.setdefault(qualified, Definition(qualified, name, str(head.value), form, sf))
 
     # -- resolution --------------------------------------------------------
     def resolve(self, symbol: Form | str, sf: SourceFile) -> str:
