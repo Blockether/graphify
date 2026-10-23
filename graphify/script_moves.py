@@ -10,13 +10,18 @@ from __future__ import annotations
 import json
 import os
 import re
+import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 
 from graphify.moves import MovePlan, project_files, replace_ranges, resolve_path
 from graphify.refactor import Mention, Unsupported, symbol_name
 
-SUFFIXES = (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts")
+SUFFIXES = (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts", ".ets", ".vue", ".svelte", ".astro")
+# Single-file components: only their script blocks are code.
+_SFC = (".vue", ".svelte", ".astro")
+_SFC_SCRIPT = re.compile(rb"(?is)<script\b(?P<attrs>[^>]*)>(?P<body>.*?)</script\s*>")
+_ASTRO_FRONT = re.compile(rb"\A(?:[ \t]*\n)*---[ \t]*\n(?P<body>.*?)\n---[ \t]*(?:\n|\Z)", re.S)
 _EXTS = (".ts", ".tsx", ".d.ts", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts")
 _JS_TO_TS = {".js": (".ts", ".tsx"), ".jsx": (".tsx",), ".mjs": (".mts",), ".cjs": (".cts",)}
 _CALLS = frozenset({
@@ -34,9 +39,44 @@ _IDENTS = frozenset({"identifier", "type_identifier", "shorthand_property_identi
 _PARSERS: dict = {}
 
 
+def script_spans(data: bytes, path: Path) -> list[tuple[int, int]]:
+    """The byte ranges of the script code in a single-file component."""
+    spans = []
+    if path.suffix.lower() == ".astro":
+        m = _ASTRO_FRONT.match(data)
+        if m:
+            spans.append((m.start("body"), m.end("body")))
+    spans += [(m.start("body"), m.end("body")) for m in _SFC_SCRIPT.finditer(data)]
+    return spans
+
+
+def _mask(data: bytes, path: Path) -> tuple[bytes, bool]:
+    """Blank every byte outside the script code and keep the offsets. Also tell if the script is TypeScript."""
+    out = bytearray(re.sub(rb"[^\n]", b" ", data))
+    for s, e in script_spans(data, path):
+        out[s:e] = data[s:e]
+    ts = path.suffix.lower() == ".astro" or any(re.search(rb"""lang\s*=\s*["']ts["']""", m.group("attrs"))
+                                                for m in _SFC_SCRIPT.finditer(data))
+    return bytes(out), ts
+
+
+def _markup_uses(data: bytes, path: Path, name: str) -> bool:
+    """Tell if the markup of a single-file component, outside its scripts and comments, names ``name``."""
+    if path.suffix.lower() not in _SFC:
+        return False
+    out = bytearray(data)
+    for s, e in script_spans(data, path):
+        out[s:e] = b" " * (e - s)
+    markup = re.sub(rb"(?s)<!--.*?-->", b"", bytes(out))
+    return re.search(rb"(?<![\w$.-])" + re.escape(name.encode()) + rb"(?![\w$-])", markup) is not None
+
+
 def _parse(data: bytes, path: Path):
     suffix = path.suffix.lower()
-    kind = "tsx" if suffix == ".tsx" else "ts" if suffix in (".ts", ".mts", ".cts") else "js"
+    kind = "tsx" if suffix == ".tsx" else "ts" if suffix in (".ts", ".mts", ".cts", ".ets") else "js"
+    if suffix in _SFC:
+        data, ts = _mask(data, path)
+        kind = "ts" if ts else "js"
     if kind not in _PARSERS:
         from tree_sitter import Language, Parser
 
@@ -374,7 +414,10 @@ def _imports(tree, data: bytes) -> list[_Import]:
 
 
 def _semi(tree, data: bytes) -> bool:
-    ends = [_text(s, data).rstrip().endswith(";") for s in tree.root_node.named_children if s.type in ("import_statement", "lexical_declaration", "expression_statement", "export_statement")]
+    kinds = ("import_statement", "lexical_declaration", "expression_statement", "export_statement")
+    ends = [_text(s, data).rstrip().endswith(";") for s in tree.root_node.named_children if s.type in kinds]
+    if not ends:  # only declarations with bodies: read the statements inside them
+        ends = [_text(s, data).rstrip().endswith(";") for s in _walk(tree.root_node) if s.type in kinds + ("return_statement",)]
     return not ends or sum(ends) * 2 >= len(ends)
 
 
@@ -439,13 +482,17 @@ def _insert_point(tree, data: bytes) -> int:
     return len(data)
 
 
-def add_import(data: bytes, path: Path, target, spec: str, *, default=None, named=(), type_only=False, alias_list=(), namespace=None) -> bytes:
-    """Import ``default`` and ``named`` texts from ``spec`` (the file ``target``), merged into an import that exists."""
+def add_import(data: bytes, path: Path, target, spec: str, *, default=None, named=(), type_only=False, alias_list=(), namespace=None, semi=None) -> bytes:
+    """Import ``default`` and ``named`` texts from ``spec`` (the file ``target``), merged into an import that exists.
+
+    ``semi`` sets the semicolon style when ``data`` has no statements to copy it from.
+    """
     tree = _parse(data, path)
+    semi = _semi(tree, data) if semi is None or data.strip() else semi
     named = list(named)
     if namespace:
         if not any(i.namespace == namespace and i.spec == spec for i in _imports(tree, data)):
-            data = _insert_line(data, tree, _statement("import", type_only, None, namespace, [], spec, _quote(tree, data, "'"), _semi(tree, data)))
+            data = _insert_line(data, tree, _statement("import", type_only, None, namespace, [], spec, _quote(tree, data, "'"), semi))
             tree = _parse(data, path)
         if not default and not named:
             return data
@@ -465,12 +512,13 @@ def add_import(data: bytes, path: Path, target, spec: str, *, default=None, name
         return replace_ranges(data, [edit])
     if not default and not named:
         return data
-    return _insert_line(data, tree, _statement("import", type_only, default, None, named, spec, _quote(tree, data), _semi(tree, data)))
+    return _insert_line(data, tree, _statement("import", type_only, default, None, named, spec, _quote(tree, data), semi))
 
 
 def _insert_line(data: bytes, tree, line: str) -> bytes:
-    line += "\n"
     at = _insert_point(tree, data)
+    indent = re.match(rb"[ \t]*", data[at:]).group().decode() if data[at:].strip() else ""
+    line = indent + line + "\n"
     if at == len(data) and data and not data.endswith(b"\n"):
         line = "\n" + line
     tail = data[at:]
@@ -628,6 +676,8 @@ def plan_move(graph: dict, node: dict, source: Path, to: str, root: Path) -> Mov
     target = _target_path(to, source, root)
     if target.suffix.lower() not in SUFFIXES:
         raise Unsupported(f"{target} is not a JavaScript or TypeScript file.")
+    if target.suffix.lower() in _SFC:
+        raise Unsupported(f"Move code out of a component into a .js or .ts file, not into {target.name}.")
     data = source.read_bytes()
     tree = _parse(data, source)
     decls, clauses, defaults = _tops(tree, data)
@@ -663,7 +713,7 @@ def plan_move(graph: dict, node: dict, source: Path, to: str, root: Path) -> Mov
     named_export = any(e.exported and not e.default for e in entries) or name in publics
     remaining_probe = _cut(step, spans + ([_line_span(step, step_defaults[name])] if name in step_defaults else []))
     left_tree = _parse(remaining_probe, source)
-    remaining = name in _idents(left_tree.root_node, remaining_probe, skip=("import_statement",))
+    remaining = name in _idents(left_tree.root_node, remaining_probe, skip=("import_statement",)) or _markup_uses(remaining_probe, source, name)
     if not any(e.exported for e in entries) and remaining and "default" not in publics:
         named_export = True
     for e, (s, end) in zip(step_decls[name], spans):
@@ -671,7 +721,8 @@ def plan_move(graph: dict, node: dict, source: Path, to: str, root: Path) -> Mov
         if named_export and not e.exported:
             at = e.stmt.start_byte - s
             piece = piece[:at] + b"export " + piece[at:]
-        pieces.append(piece.decode("utf-8", "replace").strip("\n"))
+        text = piece.decode("utf-8", "replace").strip("\n")
+        pieces.append(textwrap.dedent(text) if source.suffix.lower() in _SFC else text)
     code = "\n".join(pieces)
     semi = _semi(tree, data)
     for alias in sorted(publics - {name, "default"}):
@@ -707,7 +758,8 @@ def plan_move(graph: dict, node: dict, source: Path, to: str, root: Path) -> Mov
         if hit is not None and hit.path == target:
             continue
         spec = spell(target.parent, hit.path, hit) if hit is not None else imp.spec
-        t = add_import(t, target, hit.path if hit else None, spec, default=default, named=named, type_only=imp.type_only, alias_list=alias_list, namespace=namespace)
+        t = add_import(t, target, hit.path if hit else None, spec, default=default, named=named, type_only=imp.type_only, alias_list=alias_list, namespace=namespace,
+                       semi=_semi(tree, data))
     exports_needed = []
     if need_locals:
         n_default, n_named = None, []
@@ -721,7 +773,7 @@ def plan_move(graph: dict, node: dict, source: Path, to: str, root: Path) -> Mov
             if nm:
                 n_named.append(nm)
         spec = spell(target.parent, source, _hit_for(source, style))
-        t = add_import(t, target, source, spec, default=n_default, named=n_named, alias_list=alias_list)
+        t = add_import(t, target, source, spec, default=n_default, named=n_named, alias_list=alias_list, semi=_semi(tree, data))
     t = (t.rstrip(b"\n") + b"\n\n" if t.strip() else b"") + code.encode() + b"\n"
     contents: dict = {str(target): (tgt_data if tgt_exists else None, t)}
     if not tgt_exists:
