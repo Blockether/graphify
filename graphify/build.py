@@ -125,9 +125,13 @@ def _lost_saved_semantic_nodes(
         renamed = doc_remap.get(renamed, renamed)
         return renamed in new_ids
 
+    # The knowledge base owns its records: its overlay adds and removes them.
+    # A KB node that the overlay removed is not a lost semantic node.
+    from graphify.kb import is_kb_record
+
     lost: list[dict] = []
     for node in saved_nodes:
-        if not isinstance(node, dict) or _is_ast_tier(node):
+        if not isinstance(node, dict) or _is_ast_tier(node) or is_kb_record(node):
             continue
         if node.get("external") is True or node.get("type") == "external":
             continue
@@ -1796,6 +1800,11 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
                         and existing_score > incoming_score
                     ):
                         continue
+            # The incoming edge wins. `G.add_edge` merges attribute dicts, so a key
+            # that only the replaced edge had, most often its `confidence_score`,
+            # would survive under the new edge's confidence: an EXTRACTED call kept
+            # the 0.85 of the callback reference that it replaced. Replace the fact.
+            G[src][tgt].clear()
         G.add_edge(src, tgt, **attrs)
     hyperedges = extraction.get("hyperedges", [])
     if hyperedges:
@@ -1868,6 +1877,7 @@ def build(
     dedup_llm_backend: str | None = None,
     root: str | Path | None = None,
     protected_ids: "set[str] | None" = None,
+    kb_overlay: "dict | None" = None,
 ) -> nx.Graph:
     """Merge multiple extraction results into one graph.
 
@@ -1879,6 +1889,8 @@ def build(
     root: if given, absolute source_file paths are made relative to root (#932).
     protected_ids: optional set of node IDs to protect from being collapsed with
         other protected nodes during incremental merge (#3477).
+    kb_overlay: the knowledge-base overlay (graphify.kb.read_overlay). Its nodes,
+        edges and edits apply after dedup, so dedup never merges a KB record.
 
     With dedup disabled, extractions are merged in order and the last node's
     attributes win (NetworkX add_node overwrites). With dedup enabled, nodes
@@ -1927,6 +1939,9 @@ def build(
             protected_ids=protected_ids,
         )
         _dedup_collapsed = _before_dedup - len(combined["nodes"])
+    if kb_overlay:
+        from graphify.kb import apply_overlay
+        apply_overlay(combined, kb_overlay, links_key="edges", directed=directed)
     G = build_from_json(combined, directed=directed, root=_root, dedup=dedup)
     # CLI reads this to tell a dedup shrink from a file deletion (#3774).
     # Popped before to_json so it is not stored in graph.json.
@@ -2311,6 +2326,11 @@ def build_merge(
     if _loaded is not None:
         existing_nodes, existing_edges, existing_hyperedges, existing_directed = _loaded
         had_graph = True
+        # The knowledge base owns its records; build() applies its overlay
+        # after dedup, so the stored copies stay out of the merge.
+        from graphify.kb import is_kb_record
+        existing_nodes = [n for n in existing_nodes if not is_kb_record(n)]
+        existing_edges = [e for e in existing_edges if not is_kb_record(e)]
     else:
         existing_nodes = []
         existing_edges = []
@@ -2556,6 +2576,7 @@ def build_merge(
     } if had_graph else None
 
     all_chunks = base + list(new_chunks)
+    from graphify.kb import read_overlay
     G = build(
         all_chunks,
         directed=directed,
@@ -2563,6 +2584,7 @@ def build_merge(
         dedup_llm_backend=dedup_llm_backend,
         root=_eff_root,
         protected_ids=_protected_ids,
+        kb_overlay=read_overlay(graph_path.parent),
     )
 
     # Runs after every merge, not only under prune_sources: re-extraction strands
@@ -2621,16 +2643,18 @@ def build_merge(
             n for n, d in G.nodes(data=True)
             if not d.get("source_file") and G.degree(n) == 0
         }
+        # Knowledge-base records come from the overlay, not from a source file.
+        from graphify.kb import is_kb_record as _is_kb
         to_remove = [
             n for n, d in G.nodes(data=True)
-            if _prune_match(d.get("source_file"))
+            if _prune_match(d.get("source_file")) and not _is_kb(d)
         ]
         G.remove_nodes_from(to_remove)
         n_nodes = len(to_remove)
 
         edges_to_remove = [
             (u, v) for u, v, d in G.edges(data=True)
-            if _prune_match(d.get("source_file"))
+            if _prune_match(d.get("source_file")) and not _is_kb(d)
         ]
         if edges_to_remove:
             G.remove_edges_from(edges_to_remove)

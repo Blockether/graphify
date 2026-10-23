@@ -341,17 +341,18 @@ The built-in `edd-core` plugin reads [edd-core](https://github.com/alpha-prosoft
 
 ## Knowledge base (Blockether fork)
 
-Use `graphify kb` when you want to read, correct and grow a graph instead of only rebuilding it. It adds an ontology, consistency findings, documents and a local server with an admin interface and an HTTP API for people and agents.
+Use `graphify kb` when you want to read, correct and grow a graph instead of only rebuilding it. Notes, PDFs and web pages join the same graph as the code, and link to the functions and concepts that they name. It adds an ontology, consistency findings and a local server with an admin interface and an HTTP API for people and agents.
 
 ```bash
-graphify kb serve                 # http://127.0.0.1:7878: graph map, ontology, findings, documents, history
+graphify kb serve                 # http://127.0.0.1:7878: graph map, ontology, findings, documents, history; works on desktop, tablet and phone
 graphify kb validate --strict     # exit 1 when the graph breaks the ontology
 graphify kb infer --save          # write graphify-out/ontology.json from the current graph
-graphify kb ingest notes.md spec.pdf https://example.com/page   # --llm also extracts nodes and edges
+graphify kb ingest notes.md spec.pdf https://example.com/page   # links known names; --llm also extracts nodes and edges
 graphify kb export                # one read-only graphify-out/kb.html, no server needed
 ```
 
 - Edits, documents and history live in `graphify-out/kb/`. Edits survive `graphify update`.
+- A name that fits several nodes is not guessed: it goes to review. `[[Label]]` forces a link.
 - Every change has an author and an undo step.
 - Off loopback, the server needs `--token`. `--read-only` refuses every write.
 

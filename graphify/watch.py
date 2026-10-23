@@ -1048,6 +1048,20 @@ def _reconcile_existing_graph(
             if isinstance(_item, dict):
                 _backfill_origin(_item)
 
+    # The knowledge base owns its records (graphify-out/kb/overlay.json) and
+    # _rebuild_code adds them again after this reconciliation.  So reconcile
+    # neither keeps nor evicts them.  existing_graph_data keeps them for the
+    # shrink and topology checks.
+    from graphify.kb import is_kb_record
+    existing = {
+        **existing,
+        **{
+            _bucket: [item for item in existing[_bucket] if not is_kb_record(item)]
+            for _bucket in ("nodes", "links", "edges")
+            if isinstance(existing.get(_bucket), list)
+        },
+    }
+
     try:
         from graphify.build import _norm_source_file as _nsf
         from graphify.extract import _get_extractor
@@ -1496,8 +1510,11 @@ def _check_shrink(
         # caught rather than being waved through by the mere presence of any
         # deletion in the change set (#2056).
         return True
-    existing_nodes = existing_data.get("nodes", [])
-    new_nodes = new_data.get("nodes", [])
+    # Knowledge-base records come from the overlay, which adds and removes
+    # them. They stay out of the counts, so a removed KB node is no loss.
+    from graphify.kb import is_kb_record
+    existing_nodes = [n for n in existing_data.get("nodes", []) if not is_kb_record(n)]
+    new_nodes = [n for n in new_data.get("nodes", []) if not is_kb_record(n)]
     from graphify.build import _lost_saved_semantic_nodes
     missing = _lost_saved_semantic_nodes(existing_nodes, new_nodes, deleted_sources)
     if missing:
@@ -2207,6 +2224,26 @@ def _rebuild_code(
         # commands, queries and events, with links to their handler code.
         from graphify.domain.graph import augment as _augment_domain
         _augment_domain(result, project_root, code_files, out / "domain")
+        # The knowledge base adds its nodes, edges and edits here, before
+        # clustering.  So one graph holds the code and the knowledge, and the
+        # communities cover both.
+        from graphify.kb import apply_overlay as _apply_kb, read_overlay as _read_kb
+        try:
+            _kb_overlay = _read_kb(out)
+        except ValueError as exc:
+            print(f"[graphify watch] knowledge base left out: {exc}", file=sys.stderr)
+            _kb_overlay = None
+        if _kb_overlay is not None:
+            _kb_stats = _apply_kb(
+                result, _kb_overlay, links_key="edges",
+                directed=bool((existing_graph_data or {}).get("directed", False)),
+            )
+            if _kb_stats["conflicts"] or _kb_stats["dangling"]:
+                print(
+                    "[graphify watch] knowledge base: left out "
+                    f"{_kb_stats['conflicts']} edge(s) that join already joined nodes "
+                    f"and {_kb_stats['dangling']} edge(s) without both end nodes."
+                )
         # Source files re-extracted this run — their symbol sets may legitimately
         # shrink (a removed function), so the shrink-guard should not block the
         # write when every lost node belongs to one of them (or a deleted file).

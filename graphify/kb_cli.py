@@ -1,6 +1,6 @@
 """``graphify kb`` - the knowledge base commands.
 
-    graphify kb serve    [graph.json] [--host H] [--port P] [--token T] [--read-only] [--open]
+    graphify kb serve    [graph.json] [--host H] [--port P] [--token T] [--allow-host NAME] [--read-only] [--open]
     graphify kb export   [graph.json] [--out kb.html] [--name NAME]
     graphify kb validate [graph.json] [--limit N] [--json] [--strict]
     graphify kb infer    [graph.json] [--save] [--json]
@@ -36,7 +36,8 @@ def _parser() -> argparse.ArgumentParser:
     s.add_argument("--token", default=os.environ.get("GRAPHIFY_KB_TOKEN"),
                    help="bearer token (default $GRAPHIFY_KB_TOKEN); required off loopback")
     s.add_argument("--read-only", action="store_true")
-    s.add_argument("--allow-host", action="append", default=[], help="extra allowed Host header")
+    s.add_argument("--allow-host", action="append", default=[], metavar="NAME",
+                   help="also accept this Host header name (repeat it); needed for a DNS name on a 0.0.0.0 bind")
     s.add_argument("--open", action="store_true", help="open the browser")
 
     e = sub.add_parser("export", help="write a read-only HTML page")
@@ -130,7 +131,10 @@ def main(argv: list[str] | None = None) -> int:
                     res = kb.ingest(source.rsplit("/", 1)[-1] or "page", url=source, **common)
                 else:
                     path = Path(source)
-                    res = kb.ingest(path.name, data=path.read_bytes(), **common)
+                    data = path.read_bytes()
+                    if not data:
+                        raise KBError(f"{source} is empty; an empty file is not a document")
+                    res = kb.ingest(path.name, data=data, **common)
                 results.append(res)
                 if not args.json:
                     doc = res.get("document") or {}

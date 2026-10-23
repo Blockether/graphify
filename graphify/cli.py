@@ -558,12 +558,16 @@ def _stale_graph_sources(
             pass
         return False
 
+    from graphify.kb import is_kb_record
+
     stale: list[str] = []
     kept_alive: list[str] = []
     checked: set[str] = set()
     for n in data.get("nodes", []):
         if not isinstance(n, dict):
             continue
+        if is_kb_record(n):
+            continue  # kb/overlay.json owns knowledge-base records, not a scanned file
         sf = n.get("source_file")
         if not sf or not isinstance(sf, str) or sf in checked:
             continue
@@ -5027,7 +5031,11 @@ def dispatch_command(cmd: str) -> None:
                 print(f"[graphify extract] {exc}", file=sys.stderr)
                 sys.exit(1)
         else:
-            G = _build([merged], dedup=not no_dedup, dedup_llm_backend=dedup_backend, root=target)
+            from graphify.kb import read_overlay as _read_kb
+            G = _build(
+                [merged], dedup=not no_dedup, dedup_llm_backend=dedup_backend, root=target,
+                kb_overlay=_read_kb(graphify_out),
+            )
         stages.mark("build")
         if G.number_of_nodes() == 0:
             print(

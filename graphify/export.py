@@ -334,12 +334,19 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *,
                         file=_sys.stderr,
                     )
                     return False
-            new_n = G.number_of_nodes()
+            # Knowledge-base records come from the overlay, which adds and
+            # removes them. They stay out of the counts, so a removed KB node
+            # is no loss.
+            from graphify.kb import is_kb_record
+            existing_nodes = [n for n in existing_nodes if not is_kb_record(n)]
+            existing_n = len(existing_nodes)
             from graphify.build import _lost_saved_semantic_nodes
             new_node_list = [
                 {"id": node_id, **{key: value for key, value in attrs.items() if key != "id"}}
                 for node_id, attrs in G.nodes(data=True)
+                if not is_kb_record(attrs)
             ]
+            new_n = len(new_node_list)
             missing = _lost_saved_semantic_nodes(existing_nodes, new_node_list, set())
             if missing:
                 import sys as _sys

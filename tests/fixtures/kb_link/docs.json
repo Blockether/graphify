@@ -1,0 +1,170 @@
+[
+ {
+  "set": "eval",
+  "name": "gateway-client.md",
+  "text": "# Talking to the gateway\n\nAgents send every gateway request through `com.blockether.vis.internal.gateway.client`.\nIts `request!` function finds or starts the daemon, takes a lease and adds authentication.\nA 4xx or 5xx response is data, so the session code checks the status itself.\n\nThe wire format lives in com.blockether.vis.contract.wire: call `->wire` before\n`json-str` so every key is snake_case. See [[Gateway lease model]] for the lease rules\nand the Gateway client concept for the ownership model.\n\nThe server side is com.blockether.vis.internal.gateway.server and it keeps per-session\ndata in com.blockether.vis.internal.gateway.state. Push delivery goes through\nsrc/com/blockether/vis/internal/gateway/relay.clj when a relay grant exists.\n",
+  "gold": [
+   "doc:gateway-lease-model",
+   "kb:gateway_client",
+   "packages_vis_contract_src_com_blockether_vis_contract_wire_com_dotblockether_dotvis_dotcontract_dotwire",
+   "packages_vis_contract_src_com_blockether_vis_contract_wire_gtwire",
+   "packages_vis_contract_src_com_blockether_vis_contract_wire_json_str",
+   "src_com_blockether_vis_internal_gateway_client_com_dotblockether_dotvis_dotinternal_dotgateway_dotclient",
+   "src_com_blockether_vis_internal_gateway_client_request_bang",
+   "src_com_blockether_vis_internal_gateway_relay",
+   "src_com_blockether_vis_internal_gateway_server_com_dotblockether_dotvis_dotinternal_dotgateway_dotserver",
+   "src_com_blockether_vis_internal_gateway_state_com_dotblockether_dotvis_dotinternal_dotgateway_dotstate"
+  ],
+  "optional": [],
+  "nil": []
+ },
+ {
+  "set": "eval",
+  "name": "companion-sync.md",
+  "text": "## Companion live sync\n\nThe Companion app opens one `GatewayClient` (see apps/vis-companion/src/lib/gateway.ts)\nand hands it to SessionSubscriptionHub, which keeps a cursor per session and replays\nmissed events after a reconnect.\n\nOn iOS and Android the sign-in flow uses the native OAuthLoopback plugin. Its\n`.callback()` method receives the redirect. The Python SDK has a different\nGatewayClient in packages/vis-agent/src/blockether/vis/engine/_client.py; the app never\nloads it.\n\nStatus: done. Changed: the hub now drops a stale story when the user changes the\nsession list. Fixed the meta row.\n",
+  "gold": [
+   "apps_vis_companion_src_lib_gateway",
+   "apps_vis_companion_src_lib_gateway_gatewayclient",
+   "apps_vis_companion_src_lib_subscriptions_sessionsubscriptionhub",
+   "packages_vis_agent_src_blockether_vis_engine_client",
+   "packages_vis_agent_src_blockether_vis_engine_client_gatewayclient"
+  ],
+  "optional": [],
+  "nil": [
+   "OAuthLoopback",
+   ".callback()",
+   "Status",
+   "Changed",
+   "story",
+   "Fixed",
+   "meta"
+  ]
+ },
+ {
+  "set": "eval",
+  "name": "sandbox-policy.md",
+  "text": "# Sandbox policy review\n\nThe host policy is in com.blockether.vis.internal.sandbox.policy and the scoped rules in\ncom.blockether.vis.internal.sandbox.scoped-policy. The jail itself is\n`com.blockether.vis.internal.sandbox.jail`; its tests are in\ncom.blockether.vis.internal.sandbox.jail-test.\n\nNetwork egress runs through com.blockether.vis.internal.sandbox.egress-proxy. Its\n`start!` opens the proxy port for the session. Python execution sits in\ncom.blockether.vis.internal.python.runtime and the extension bridge in\ncom.blockether.vis.internal.python.extensions.\n\nTests use lazytest.core and clojure.string; shell steps use babashka.process.\nThe policy must stay strict: start the jail before you run any user code.\n",
+  "gold": [
+   "clojure_ns_babashka_dot_process",
+   "clojure_ns_clojure_dot_string",
+   "clojure_ns_lazytest_dot_core",
+   "doc:sandbox-policy",
+   "resources_vis_docs_jail_network_egress",
+   "src_com_blockether_vis_internal_python_extensions_com_dotblockether_dotvis_dotinternal_dotpython_dotextensions",
+   "src_com_blockether_vis_internal_python_runtime_com_dotblockether_dotvis_dotinternal_dotpython_dotruntime",
+   "src_com_blockether_vis_internal_sandbox_egress_proxy_com_dotblockether_dotvis_dotinternal_dotsandbox_dotegress_proxy",
+   "src_com_blockether_vis_internal_sandbox_egress_proxy_start_bang",
+   "src_com_blockether_vis_internal_sandbox_jail_com_dotblockether_dotvis_dotinternal_dotsandbox_dotjail",
+   "src_com_blockether_vis_internal_sandbox_policy_com_dotblockether_dotvis_dotinternal_dotsandbox_dotpolicy",
+   "src_com_blockether_vis_internal_sandbox_scoped_policy_com_dotblockether_dotvis_dotinternal_dotsandbox_dotscoped_policy",
+   "test_com_blockether_vis_internal_sandbox_jail_test_com_dotblockether_dotvis_dotinternal_dotsandbox_dotjail_test"
+  ],
+  "optional": [],
+  "nil": [
+   "policy",
+   "start",
+   "jail",
+   "session"
+  ]
+ },
+ {
+  "set": "eval",
+  "name": "docs-tour.md",
+  "text": "# Manual tour\n\nNew readers start with the README.md and then Running a gateway. The concept pages\ncouncil.md, drafts.md, sessions.md and live-views.md explain each feature; the matching\nAPI pages are council-api.md, drafts-api.md and sessions-api.md.\n\nWhen something breaks, follow Reporting a bug. Automations have their own pages:\nautomations.md for the concept and automations-api.md for the calls.\n\nEach page has a When to use section and a See also list. Before you start, read the\nCHANGELOG.md entry for your version.\n",
+  "gold": [
+   "changelog",
+   "readme",
+   "resources_vis_docs_automations",
+   "resources_vis_docs_automations_api",
+   "resources_vis_docs_council",
+   "resources_vis_docs_council_api",
+   "resources_vis_docs_drafts",
+   "resources_vis_docs_drafts_api",
+   "resources_vis_docs_gateway_service_running_a_gateway",
+   "resources_vis_docs_live_views",
+   "resources_vis_docs_reporting_bugs_reporting_a_bug",
+   "resources_vis_docs_sessions",
+   "resources_vis_docs_sessions_api"
+  ],
+  "optional": [],
+  "nil": [
+   "When to use",
+   "See also",
+   "Before you start"
+  ]
+ },
+ {
+  "set": "eval",
+  "name": "sdk-sessions.md",
+  "text": "## Reading sessions from the Python SDK\n\nThe SDK module packages/vis-agent/src/blockether/vis/_outside.py exposes\n`list_sessions()` and `read_session()` for scripts outside the sandbox. Inside an\nextension, use the `Sessions` class of blockether.vis.extension instead\n(packages/vis-agent/src/blockether/vis/extension.py).\n\nThe TUI keeps its own transport: apps/vis-tui/src/com/blockether/vis/tui/client.clj\ncalls com.blockether.vis.tui.client/request! for each poll. The Council namespace\ncom.blockether.vis.internal.council.core has a `request!` of its own for peer questions.\n\nA client should read the status, restore the cursor and run the request again.\n",
+  "gold": [
+   "apps_vis_tui_src_com_blockether_vis_tui_client",
+   "apps_vis_tui_src_com_blockether_vis_tui_client_request_bang",
+   "packages_vis_agent_src_blockether_vis_extension",
+   "packages_vis_agent_src_blockether_vis_extension_sessions",
+   "packages_vis_agent_src_blockether_vis_outside",
+   "packages_vis_agent_src_blockether_vis_outside_list_sessions",
+   "packages_vis_agent_src_blockether_vis_outside_read_session",
+   "src_com_blockether_vis_internal_council_core_com_dotblockether_dotvis_dotinternal_dotcouncil_dotcore",
+   "src_com_blockether_vis_internal_council_core_request_bang"
+  ],
+  "optional": [],
+  "nil": [
+   "client",
+   "status",
+   "restore",
+   "run",
+   "request"
+  ]
+ },
+ {
+  "set": "hard",
+  "name": "pl-mixed.md",
+  "text": "## Synchronizacja sesji w aplikacji Companion\n\nAplikacja mobilna subskrybuje zmiany przez `SessionSubscriptionHub`. Ekran ustawień maszyny to `MachineSettings()`.\nKlient gatewaya w Pythonie, czyli GatewayClient z modułu `engine/_client.py`, odpytuje sesje.\nGdy agent kończy turę, funkcja `read_session()` z pliku `vis/_outside.py` czyta historię sesji.\n\nSzkice opisuje strona Drafts. Automatyzacje (Automations) uruchamiają prompt według harmonogramu.\nSesja, klient, żądanie i status to tutaj zwykłe słowa. Zażółć gęślą jaźń: Agent działa, Session trwa.\nFunkcja `fold_session()` nie istnieje w grafie.\n",
+  "gold": [
+   "apps_vis_companion_src_lib_subscriptions_sessionsubscriptionhub",
+   "apps_vis_companion_src_screens_settings_machinesettings_machinesettings",
+   "packages_vis_agent_src_blockether_vis_engine_client_gatewayclient",
+   "packages_vis_agent_src_blockether_vis_outside_read_session",
+   "resources_vis_docs_automations_automations",
+   "resources_vis_docs_drafts_drafts"
+  ],
+  "optional": [
+   "packages_vis_agent_src_blockether_vis_engine_client",
+   "packages_vis_agent_src_blockether_vis_outside"
+  ],
+  "nil": [
+   "sesja",
+   "klient",
+   "status",
+   "fold_session",
+   "agent",
+   "session"
+  ]
+ },
+ {
+  "set": "hard",
+  "name": "short-names.md",
+  "text": "# Running the agent\n\nCall `run()` to start the job, then `get()` the result. The Session object holds state, and a Client sends each request.\nTo get the status, run the command again. A session can restore its client after a restart.\n\nIn `packages/vis-agent/src/blockether/vis/engine/_client.py` the `Session` class wraps the `GatewayClient`.\nThe `Agent` class in `engine/_agent.py` drives the loop and calls `run()` on every turn.\n\nSettings live in the config. The main loop is simple. Get it, run it, request it.\n",
+  "gold": [
+   "packages_vis_agent_src_blockether_vis_engine_agent_agent",
+   "packages_vis_agent_src_blockether_vis_engine_client_gatewayclient",
+   "packages_vis_agent_src_blockether_vis_engine_client_session"
+  ],
+  "optional": [
+   "packages_vis_agent_src_blockether_vis_engine_agent",
+   "packages_vis_agent_src_blockether_vis_engine_client"
+  ],
+  "nil": [
+   "run",
+   "get",
+   "client",
+   "request",
+   "status",
+   "restore",
+   "settings",
+   "config",
+   "main"
+  ]
+ }
+]

@@ -256,3 +256,24 @@ def test_same_relation_collision_preserves_extracted_over_inferred():
         assert d.get("confidence_score") == 1.0
         assert d.get("source_file") == "a.py"
         assert d.get("source_location") == "L724"
+
+
+
+@pytest.mark.parametrize("callback_src, callback_tgt", [("a", "b"), ("b", "a")])
+def test_collapsed_edge_keeps_no_attribute_of_the_replaced_edge(callback_src, callback_tgt):
+    """The edge that wins a collapse replaces the stored edge; it does not merge into it.
+
+    A callback reference (`indirect_call`, INFERRED 0.85) and a direct call back the
+    other way (EXTRACTED, no score) share one undirected pair. `G.add_edge` merges
+    attribute dicts, so a winning call kept the 0.85 of the replaced reference: an
+    EXTRACTED edge with an INFERRED score. Every attribute of the survivor must come
+    from one input edge, in either id order."""
+    callback = _edge("indirect_call", src=callback_src, tgt=callback_tgt,
+                     confidence="INFERRED", confidence_score=0.85, source_location="L114")
+    call = _edge("calls", src=callback_tgt, tgt=callback_src, source_location="L199")
+    d = edge_data(build_from_json(_extraction([callback, call])), "a", "b")
+    winner = call if d.get("relation") == "calls" else callback
+    assert d.get("confidence") == winner["confidence"]
+    assert d.get("confidence_score") == winner.get("confidence_score")
+    assert (d.get("_src"), d.get("_tgt")) == (winner["source"], winner["target"])
+    assert d.get("source_location") == winner["source_location"]

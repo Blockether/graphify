@@ -2,15 +2,18 @@
 
 The file embeds the viewer from ``graphify/kb_ui`` and a JSON copy of the
 graph, the ontology, the findings and the documents. It needs no server.
-Document assets stay in ``kb/documents`` and load with relative links, so
-keep the file next to the ``kb`` folder (the default place).
+Document assets stay in ``kb/documents`` and load with relative links.
+``asset_base`` in the payload is the path from the page to that folder, so an
+export into a subfolder (or outside the output folder) still finds them.
 """
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from graphify.kb import KnowledgeBase
 
@@ -57,7 +60,22 @@ def _inline_text(text: str, tag: str) -> str:
     return re.sub(rf"</({tag})", r"<\\/\1", text, flags=re.IGNORECASE)
 
 
-def static_payload(kb: KnowledgeBase, *, name: str | None = None) -> dict[str, Any]:
+def asset_base(kb: KnowledgeBase, target: str | Path | None = None) -> str:
+    """Return the URL path from the page at ``target`` to ``kb/documents/``.
+
+    The path is relative, so the page works under ``file://`` and on any web
+    server. On another drive (Windows) it falls back to a ``file:`` URI.
+    """
+    docs = kb.docs_dir.resolve()
+    folder = Path(target).resolve().parent if target else kb.out_dir.resolve()
+    try:
+        rel = os.path.relpath(docs, folder)
+    except ValueError:
+        return docs.as_uri() + "/"
+    return "/".join(p if p in (".", "..") else quote(p, safe="") for p in Path(rel).parts) + "/"
+
+
+def static_payload(kb: KnowledgeBase, *, name: str | None = None, target: str | Path | None = None) -> dict[str, Any]:
     """Collect the data that the read-only viewer needs."""
     with kb._lock:
         view = kb.graph_view()
@@ -75,12 +93,13 @@ def static_payload(kb: KnowledgeBase, *, name: str | None = None) -> dict[str, A
         "report": kb.validate(limit=2000),
         "documents": documents,
         "details": _details(nodes),
+        "asset_base": asset_base(kb, target),
     }
 
 
-def render_static_html(kb: KnowledgeBase, *, name: str | None = None) -> str:
-    """Return the complete read-only HTML page as text."""
-    payload = static_payload(kb, name=name)
+def render_static_html(kb: KnowledgeBase, *, name: str | None = None, target: str | Path | None = None) -> str:
+    """Return the complete read-only HTML page as text (for a page at ``target``)."""
+    payload = static_payload(kb, name=name, target=target)
     page = (UI_DIR / "index.html").read_text(encoding="utf-8")
     css = _inline_text((UI_DIR / "style.css").read_text(encoding="utf-8"), "style")
     js = _inline_text((UI_DIR / "app.js").read_text(encoding="utf-8"), "script")
@@ -107,6 +126,6 @@ def write_static_html(kb: KnowledgeBase, path: str | Path | None = None, *, name
     target = Path(path) if path else kb.out_dir / "kb.html"
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_name(target.name + ".tmp")
-    tmp.write_text(render_static_html(kb, name=name), encoding="utf-8")
+    tmp.write_text(render_static_html(kb, name=name, target=target), encoding="utf-8")
     tmp.replace(target)
     return target
