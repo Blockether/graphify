@@ -1633,7 +1633,8 @@ class KnowledgeBase:
         with self._lock:
             for node in self.data["nodes"]:
                 node_cls = self.node_class(node)
-                if cls and node_cls != cls:
+                # A class filter also takes the subclasses (RDFS rule rdfs9): code finds code.function.
+                if cls and not self.ontology.is_a(node_cls, cls):
                     continue
                 label = str(node.get("label") or "").lower()
                 nid = str(node.get("id")).lower()
@@ -2292,8 +2293,9 @@ class KnowledgeBase:
         made: dict[tuple[str, str | None], str] = {}
         for target, cls, offset in wiki_links(body or ""):
             found = resolve_wiki(
-                target, self._link_index(), cls=cls, class_of=self.ontology.node_class, anchors=ids)
-            if found.status == "unique":
+                target, self._link_index(), cls=cls, class_of=self.ontology.node_class, onto=self.ontology,
+                anchors=ids)
+            if found.status in ("id", "unique"):
                 nid = found.ids[0]
             elif found.status == "missing":
                 key = (graph_norm_label(target), cls)
@@ -2396,8 +2398,9 @@ class KnowledgeBase:
     def _wiki_text(self, body: str, nid: str) -> str:
         """Return the ``[[...]]`` target in ``body`` that resolves to ``nid``."""
         for target, cls, _offset in wiki_links(body or ""):
-            found = resolve_wiki(target, self._link_index(), cls=cls, class_of=self.ontology.node_class)
-            if found.status == "unique" and found.ids[0] == nid:
+            found = resolve_wiki(
+                target, self._link_index(), cls=cls, class_of=self.ontology.node_class, onto=self.ontology)
+            if found.status in ("id", "unique") and found.ids[0] == nid:
                 return target
         return str((self._nodes.get(nid) or {}).get("label") or nid)
 

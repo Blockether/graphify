@@ -138,6 +138,37 @@ def test_search_finds_nodes_and_documents(kb):
     assert kb.search("zzzz-nothing") == []
 
 
+def _method_kb(tmp_path):
+    out = tmp_path / "graphify-out"
+    out.mkdir()
+    graph = {"directed": True, "multigraph": False, "graph": {}, "nodes": [
+        {"id": "cls_svc", "label": "Service", "file_type": "code", "source_file": "s.py"},
+        {"id": "fn_run", "label": ".run()", "file_type": "code", "source_file": "s.py"},
+    ], "links": [{"source": "cls_svc", "target": "fn_run", "relation": "method", "confidence": "EXTRACTED"}]}
+    (out / "graph.json").write_text(json.dumps(graph), encoding="utf-8")
+    return KnowledgeBase(out / "graph.json")
+
+
+def test_search_class_filter_takes_subclasses(tmp_path):
+    # Found in the vis-graphify release check: code nodes have subclasses, so cls="code" found no method.
+    kb = _method_kb(tmp_path)
+    assert [hit["class"] for hit in kb.search("run")] == ["code.method"]
+    for cls in ("code", "code.function", "code.method"):
+        assert [hit["id"] for hit in kb.search("run", cls=cls)] == ["fn_run"]
+    assert kb.search("run", cls="code.class") == []
+    assert [hit["id"] for hit in kb.search("service", cls="code")] == ["cls_svc"]
+
+
+def test_wiki_links_find_code_nodes_by_parent_class_and_by_id(tmp_path):
+    # Found in the same release check: [[run|code]] made a second node next to the code.method node,
+    # and a link to an exact node id went to review.
+    kb = _method_kb(tmp_path)
+    doc = kb.create_document("Notes", body="See [[run|code]] and [[cls_svc]].")
+    full = kb.get_document(doc["id"])
+    assert {x["id"] for x in full["linked"]} == {"fn_run", "cls_svc"} and full["possible"] == []
+    assert [n["id"] for n in kb.data["nodes"] if n.get("label") in (".run()", "run")] == ["fn_run"]
+
+
 def test_validate_flags_class_outside_ontology(kb):
     # E2E bug 18: an open ontology accepts the class and validation warns.
     kb.set_ontology({"classes": [{"name": "code"}, {"name": "rationale"}],

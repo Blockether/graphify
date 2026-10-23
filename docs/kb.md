@@ -232,7 +232,7 @@ Each decision is one change in the history. The **Undo** button in the message a
 Write the link yourself when the automatic decision is wrong or missing:
 
 - `[[Payment service]]` links the node with that label.
-- `[[Payment service|concept]]` links only a node of class `concept`.
+- `[[Payment service|concept]]` links only a node of class `concept` or of one of its subclasses. For example, `[[run|code]]` finds a `code.method` node.
 - `[[kb:payment_service]]` links the node with that exact id.
 
 The result depends on the matches:
@@ -342,7 +342,7 @@ This section is a reference for agents and scripts. All routes return JSON.
 | `GET /api/overview` | One row for each community, and the edge counts between communities. |
 | `GET /api/community/<id>` | The nodes and inner edges of one community, and its edges to other communities. |
 | `GET /api/graph` | The whole graph in a compact form. |
-| `GET /api/search?q=&limit=&class=` | Nodes and documents. |
+| `GET /api/search?q=&limit=&class=` | Nodes and documents. `class` also finds the nodes of its subclasses. |
 | `GET /api/nodes/<id>`, `GET /api/nodes?label=` | One node with its connections. |
 | `POST /api/nodes`, `PATCH /api/nodes/<id>`, `DELETE /api/nodes/<id>` | Add, change (`{"attrs": {...}}`, `null` removes a key) or delete a node. |
 | `POST /api/edges`, `PATCH`/`DELETE /api/edges/<id>` | Add, change or delete an edge. |

@@ -1348,20 +1348,26 @@ def resolve_wiki(
     *,
     cls: str | None = None,
     class_of: Callable[[dict[str, Any]], str | None] | None = None,
+    onto: Any = None,
     anchors: Iterable[str] = (),
 ) -> WikiResult:
     """Resolve ``[[target]]`` or ``[[target|class]]``.
 
     An exact node id wins.  Else the label must fit exactly one node (of the
-    class, when one is given).  An ambiguous label is never guessed: the
-    caller stores it for review and creates no duplicate node (memo R4).
+    class, when one is given).  With ``onto``, the subclasses fit too:
+    ``[[run|code]]`` finds a ``code.method`` node.  An ambiguous label is
+    never guessed: the caller stores it for review and creates no duplicate
+    node (memo R4).
     """
     name = str(target or "").strip()
     if name in index.nodes:
         return WikiResult("id", [name], name, cls)
     cands = index.candidates(label_key(name))
     if cls and class_of is not None:
-        cands = [c for c in cands if class_of(index.nodes[c]) == cls]
+        if onto is not None:
+            cands = [c for c in cands if onto.is_a(class_of(index.nodes[c]), cls)]
+        else:
+            cands = [c for c in cands if class_of(index.nodes[c]) == cls]
     if len(cands) == 1:
         return WikiResult("unique", cands, name, cls)
     if not cands:

@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 
 from graphify import kb_link as KL
+from graphify.ontology import Ontology
 
 
 def _node(nid, label, src, **extra):
@@ -259,6 +260,15 @@ def test_resolve_wiki_never_guesses():
         class_of=lambda n: "py" if n["source_file"].endswith(".py") else "ts",
     )
     assert by_class.status == "unique" and by_class.ids == ["py_client"]
+
+
+def test_resolve_wiki_class_takes_subclasses():
+    # Found in the release check: [[GatewayClient|code]] missed a code.class node, so the KB made a second node.
+    def class_of(node):
+        return "code.class" if node["source_file"].endswith(".py") else "concept"
+
+    found = KL.resolve_wiki("GatewayClient", _index(), cls="code", class_of=class_of, onto=Ontology())
+    assert found.status == "unique" and found.ids == ["py_client"]
 
 
 # -- cases from the independent evaluation (#8065, #8070) ------------------
