@@ -665,3 +665,29 @@ def test_ordinary_rationale_untouched(tmp_path):
     labels = _labels(extract_python(path))
     assert any("chunked processing because the dataset exceeds RAM" in label for label in labels)
     assert not any("[redacted]" in label for label in labels)
+
+
+
+def test_docstring_of_a_colliding_name_links_its_salted_node(tmp_path):
+    """`Agreement` and `agreement()` mint one plain id, so the extractor salts both
+    (#2810). The docstring pass kept the plain id: both docstrings and the method
+    docstring pointed at a missing node and stayed isolated after the build."""
+    path = _write_py(tmp_path, '''
+        class Agreement:
+            """How well automatic results agree with human labels of the same items."""
+
+            def score(self):
+                """The share of equal pairs, from zero to one hundred percent."""
+
+
+        def agreement(pairs):
+            """Compare automatic results with human labels, one pair at a time."""
+    ''')
+    result = extract_python(path)
+    ids = {n["id"] for n in result["nodes"]}
+    links = [e for e in result["edges"] if e["relation"] == "rationale_for"]
+    assert len(links) == 3
+    assert all(e["target"] in ids for e in links)
+    G = build_from_json(result)
+    rationale = [n["id"] for n in result["nodes"] if n.get("file_type") == "rationale"]
+    assert rationale and all(G.degree(rid) == 1 for rid in rationale)
