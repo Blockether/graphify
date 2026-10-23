@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>graphify knowledge base</title>
+<meta name="description" content="Browse, edit and check a graphify knowledge graph, its ontology and its documents.">
+<link rel="stylesheet" href="/ui/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-name">graphify</span>
+    <span class="brand-sub" id="kb-name">Knowledge base</span>
+  </div>
+  <nav class="tabs" aria-label="Views">
+    <a class="tab" href="#/graph" data-tab="graph">Graph</a>
+    <a class="tab" href="#/ontology" data-tab="ontology">Ontology</a>
+    <a class="tab" href="#/findings" data-tab="findings">Findings</a>
+    <a class="tab" href="#/documents" data-tab="documents">Documents</a>
+    <a class="tab" href="#/history" data-tab="history" data-write>History</a>
+  </nav>
+  <div class="search" role="search">
+    <label class="visually-hidden" for="search-input">Search nodes and documents</label>
+    <input id="search-input" type="search" placeholder="Search nodes and documents" autocomplete="off"
+      role="combobox" aria-expanded="false" aria-controls="search-results" aria-autocomplete="list">
+    <kbd class="search-key" aria-hidden="true">/</kbd>
+    <ul id="search-results" class="search-results" role="listbox" hidden></ul>
+  </div>
+  <div class="status">
+    <span class="figure" id="count-nodes">0</span><span class="status-label">nodes</span>
+    <span class="figure" id="count-edges">0</span><span class="status-label">edges</span>
+    <span class="status-state" id="live-state">Connecting</span>
+  </div>
+</header>
+<main id="app" class="app">
+  <noscript>
+    <section class="noscript">
+      <h1>This knowledge base needs JavaScript</h1>
+      <p>The graph map, the editors and the live updates run in the browser. Turn on JavaScript, or read the raw data at <a href="/api/stats">/api/stats</a> and <a href="/api/graph">/api/graph</a>.</p>
+    </section>
+  </noscript>
+</main>
+<div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+<script src="/ui/app.js"></script>
+</body>
+</html>

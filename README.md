@@ -6,7 +6,7 @@
   <a href="https://trendshift.io/repositories/25296?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-25296" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/25296" alt="Graphify-Labs%2Fgraphify | Trendshift" width="250" height="55"/></a>
 </p>
 
-> **Blockether fork.** This fork adds full Clojure support (`.clj`, `.cljs`, `.cljc`, `.bb`, `deps.edn`, `project.clj`) through [Blockether/tree-sitter-clojure](https://github.com/Blockether/tree-sitter-clojure), including Clojure 1.12 and 1.13 syntax. Namespaces, vars, macros, protocols, records, multimethods, specs and tests become nodes, and calls resolve across namespaces. `graphify domain` maps framework flows (commands, queries, events and their Malli schemas) through plugins; see [Domain flows](#domain-flows-blockether-fork). `graphify.refactor` finds exact references and renames symbols in every language; see [References and renames](#references-and-renames-blockether-fork). Install it with `uv tool install "graphifyy @ git+https://github.com/Blockether/graphify@v0.9.93-blockether.5"` (a C compiler builds the grammar).
+> **Blockether fork.** This fork adds full Clojure support (`.clj`, `.cljs`, `.cljc`, `.bb`, `deps.edn`, `project.clj`) through [Blockether/tree-sitter-clojure](https://github.com/Blockether/tree-sitter-clojure), including Clojure 1.12 and 1.13 syntax. Namespaces, vars, macros, protocols, records, multimethods, specs and tests become nodes, and calls resolve across namespaces. `graphify domain` maps framework flows (commands, queries, events and their Malli schemas) through plugins; see [Domain flows](#domain-flows-blockether-fork). `graphify.refactor` finds exact references and renames symbols in every language; see [References and renames](#references-and-renames-blockether-fork). `graphify kb` serves the graph as an editable knowledge base with an ontology, findings, documents and an HTTP API; see [Knowledge base](#knowledge-base-blockether-fork). Install it with `uv tool install "graphifyy @ git+https://github.com/Blockether/graphify@v0.9.93-blockether.11"` (a C compiler builds the grammar).
 
 <div align="center">
 <details><summary><b>Read this in other languages</b></summary>
@@ -338,6 +338,24 @@ Both encourage scoped graph queries before broad source searches. Choose the ins
 `graphify domain .` reads the commands, queries, events and effects that your Clojure services register, and connects them across services. It writes `graphify-out/domain/DOMAIN.md` with Mermaid flowcharts, sequence diagrams and findings, `domain.json`, and one JSON Schema for each Malli schema. It reports calls to commands or queries that no service registers. `graphify update .` adds the same elements to the graph.
 
 The built-in `edd-core` plugin reads [edd-core](https://github.com/alpha-prosoft/edd-core) services. Add a plugin for another framework as a Python file in `.graphify/plugins/`, as a package entry point or with `GRAPHIFY_PLUGINS`. Guide: **[Domain flows](docs/domain.md)**.
+
+## Knowledge base (Blockether fork)
+
+Use `graphify kb` when you want to read, correct and grow a graph instead of only rebuilding it. It adds an ontology, consistency findings, documents and a local server with an admin interface and an HTTP API for people and agents.
+
+```bash
+graphify kb serve                 # http://127.0.0.1:7878: graph map, ontology, findings, documents, history
+graphify kb validate --strict     # exit 1 when the graph breaks the ontology
+graphify kb infer --save          # write graphify-out/ontology.json from the current graph
+graphify kb ingest notes.md spec.pdf https://example.com/page   # --llm also extracts nodes and edges
+graphify kb export                # one read-only graphify-out/kb.html, no server needed
+```
+
+- Edits, documents and history live in `graphify-out/kb/`. Edits survive `graphify update`.
+- Every change has an author and an undo step.
+- Off loopback, the server needs `--token`. `--read-only` refuses every write.
+
+Guide and API reference: **[Knowledge base](docs/kb.md)**.
 
 ## References and renames (Blockether fork)
 

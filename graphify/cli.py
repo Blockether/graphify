@@ -2783,6 +2783,11 @@ def dispatch_command(cmd: str) -> None:
 
         sys.exit(_domain_main(sys.argv[2:]))
 
+    elif cmd == "kb":
+        from graphify.kb_cli import main as _kb_main
+
+        sys.exit(_kb_main(sys.argv[2:]))
+
     elif cmd == "update":
         force = os.environ.get("GRAPHIFY_FORCE", "").lower() in ("1", "true", "yes")
         no_cluster = False
