@@ -1,10 +1,45 @@
 from __future__ import annotations
 
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Any
 
 import pytest
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_xdist_auto_num_workers(config: pytest.Config) -> int | None:
+    """Run one test file or named test ids in one process.
+
+    Starting a worker per CPU costs more than such a run takes. A directory
+    or the full suite returns None, so xdist uses every CPU. An explicit
+    ``-n N`` does not call this hook.
+    """
+    files = {arg.split("::", 1)[0] for arg in config.args}
+    if len(files) == 1 and files.pop().endswith(".py"):
+        return 0
+    return None
+
+
+@pytest.fixture
+def staged_package(tmp_path, monkeypatch) -> Path:
+    """Point ``graphify.install`` at a copy of the packaged assets.
+
+    The installers find skills and always-on files from ``Path(__file__)``.
+    A test that replaces a skill bundle changes only this copy. The real
+    package tree stays the same for the parallel workers that read it.
+    """
+    import graphify.install as install
+
+    staged = tmp_path / "package" / "graphify"
+    shutil.copytree(
+        Path(install.__file__).parent,
+        staged,
+        ignore=shutil.ignore_patterns("*.py", "*.pyc", "__pycache__"),
+    )
+    monkeypatch.setattr(install, "__file__", str(staged / "install.py"))
+    return staged
 
 
 @pytest.fixture(scope="session")

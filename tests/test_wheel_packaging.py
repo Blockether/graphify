@@ -17,6 +17,10 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 PKG = REPO / "graphify"
 
+# Each xdist worker would build its own wheel in the shared repo tree, and
+# parallel builds break each other. Keep these tests on one worker.
+pytestmark = pytest.mark.xdist_group("wheel_build")
+
 
 def _has_build() -> bool:
     try:

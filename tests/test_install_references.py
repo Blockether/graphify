@@ -29,39 +29,23 @@ PKG_DIR = Path(graphify.__file__).parent
 
 
 @pytest.fixture()
-def fake_bundle():
-    """Stage a fake references/ bundle in claude's slot, then restore the real one.
+def fake_bundle(staged_package):
+    """Stage a fake references/ bundle in claude's slot of a package copy.
 
     Yields the platform name. claude is used because its skill_refs bundle is
-    "claude" and it has no extra plugin wiring. The real committed bundle is
-    moved aside for the duration and put back afterward, so the on-disk package
-    is left exactly as found.
+    "claude" and it has no extra plugin wiring. ``staged_package`` keeps the
+    on-disk package exactly as found.
     """
     platform = "claude"
     bundle = mainmod._PLATFORM_CONFIG[platform]["skill_refs"]
-    skills_root = PKG_DIR / "skills"
-    bundle_dir = skills_root / bundle
+    bundle_dir = staged_package / "skills" / bundle
     refs_dir = bundle_dir / "references"
 
-    created_root = not skills_root.exists()
-    backup_dir = None
-    if bundle_dir.exists():
-        backup_dir = Path(tempfile.mkdtemp()) / "bundle_backup"
-        shutil.move(str(bundle_dir), str(backup_dir))
-
+    shutil.rmtree(bundle_dir, ignore_errors=True)
     refs_dir.mkdir(parents=True, exist_ok=True)
     (refs_dir / "extraction-spec.md").write_text("# extraction spec fragment\n", encoding="utf-8")
     (refs_dir / "query.md").write_text("# query fragment\n", encoding="utf-8")
-    try:
-        yield platform
-    finally:
-        if bundle_dir.exists():
-            shutil.rmtree(bundle_dir, ignore_errors=True)
-        if backup_dir is not None:
-            shutil.move(str(backup_dir), str(bundle_dir))
-            shutil.rmtree(backup_dir.parent, ignore_errors=True)
-        elif created_root:
-            shutil.rmtree(skills_root, ignore_errors=True)
+    yield platform
 
 
 def _install(tmp_path, platform):
@@ -177,7 +161,9 @@ def test_check_skill_version_ignores_permission_error(tmp_path, fake_bundle, mon
     assert out.err == ""
 
 
-def test_hard_fail_when_bundle_dir_present_but_references_missing(tmp_path, monkeypatch):
+def test_hard_fail_when_bundle_dir_present_but_references_missing(
+    tmp_path, monkeypatch, staged_package
+):
     """A bundle dir that exists but has no references/ subdir is a malformed
     package: exit 1 rather than silently shipping an empty sidecar.
 
@@ -187,31 +173,17 @@ def test_hard_fail_when_bundle_dir_present_but_references_missing(tmp_path, monk
     """
     platform = "claude"
     bundle = mainmod._PLATFORM_CONFIG[platform]["skill_refs"]
-    skills_root = PKG_DIR / "skills"
-    bundle_dir = skills_root / bundle
+    bundle_dir = staged_package / "skills" / bundle
 
-    created_root = not skills_root.exists()
-    backup_dir = None
-    if bundle_dir.exists():
-        backup_dir = Path(tempfile.mkdtemp()) / "bundle_backup"
-        shutil.move(str(bundle_dir), str(backup_dir))
+    shutil.rmtree(bundle_dir, ignore_errors=True)
     # Bundle dir present, but no references/ subdir inside it.
     bundle_dir.mkdir(parents=True, exist_ok=True)
     (bundle_dir / "SKILL.md").write_text("body\n", encoding="utf-8")
-    try:
-        with pytest.raises(SystemExit) as exc:
-            with patch("graphify.__main__.Path.home", return_value=tmp_path):
-                monkeypatch.chdir(tmp_path)
-                mainmod._copy_skill_file("claude")
-        assert exc.value.code == 1
-    finally:
-        if bundle_dir.exists():
-            shutil.rmtree(bundle_dir, ignore_errors=True)
-        if backup_dir is not None:
-            shutil.move(str(backup_dir), str(bundle_dir))
-            shutil.rmtree(backup_dir.parent, ignore_errors=True)
-        elif created_root:
-            shutil.rmtree(skills_root, ignore_errors=True)
+    with pytest.raises(SystemExit) as exc:
+        with patch("graphify.__main__.Path.home", return_value=tmp_path):
+            monkeypatch.chdir(tmp_path)
+            mainmod._copy_skill_file("claude")
+    assert exc.value.code == 1
 
 
 def _first_unbuilt_progressive_host():
@@ -422,6 +394,9 @@ def _build_wheel_names(repo_root):
             return set(zf.namelist())
 
 
+# This test builds a wheel in the repo tree, like tests/test_wheel_packaging.py.
+# Parallel builds break each other, so both stay on one xdist worker.
+@pytest.mark.xdist_group("wheel_build")
 def test_built_wheel_ships_the_full_skill_payload():
     """The built wheel must carry every skill body, reference, and always-on block.
 

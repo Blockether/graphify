@@ -156,6 +156,7 @@ dev = [
     "tree-sitter-hcl>=1.2.0",
     "tree-sitter-ocaml>=0.25.0",
     "tree-sitter-commonlisp>=0.4.1",
+    "pytest-xdist>=3.8.0",
 ]
 
 [tool.uv]
@@ -179,6 +180,10 @@ graphify = ["skill.md", "skill-codex.md", "skill-opencode.md", "skill-kilo.md", 
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Spread a directory or full-suite run over every CPU (pytest-xdist). A run of
+# one file or of named test ids stays in one process: see tests/conftest.py.
+# loadgroup keeps each xdist_group on one worker (the wheel build).
+addopts = ["-n", "auto", "--dist", "loadgroup"]
 norecursedirs = [
     "graphify-benchmark", "graphify_eval", "graphify_test",
     "worked", "llm-stack-corpus", "llm-stack-demo", "product-site",
