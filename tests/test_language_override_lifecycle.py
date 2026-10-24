@@ -137,8 +137,15 @@ def drive_watch(root, monkeypatch, actions, *, observed_roots=None):
         return original_rebuild(path, **kwargs)
 
     steps = iter(actions)
+    real_sleep = watch_mod.time.sleep
+    watcher = threading.current_thread()
 
-    def pump(_seconds):
+    def pump(seconds):
+        # The patch replaces time.sleep in the whole process. A thread that an
+        # earlier test left on this xdist worker gets the real sleep, so it
+        # cannot take the events of this test.
+        if threading.current_thread() is not watcher:
+            return real_sleep(seconds)
         try:
             event = next(steps)()
         except StopIteration:
