@@ -156,6 +156,20 @@ def test_cli_validate_infer_export_ingest(tmp_path, capsys):
     assert "Ingested" in capsys.readouterr().out
 
 
+def test_cli_move(tmp_path, capsys):
+    graph = make_graph(tmp_path)
+    assert kb_main(["move", "a", "a_v2", "gone", "elsewhere", "--graph", str(graph), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == [
+        {"from": "a", "to": "a_v2", "status": "pending"},
+        {"from": "gone", "to": "elsewhere", "status": "skipped"},
+    ]
+    assert KnowledgeBase(graph).overlay["moved_nodes"] == {"a": "a_v2"}
+    assert kb_main(["move", "b", "b_v2", "--graph", str(graph)]) == 0
+    assert capsys.readouterr().out.strip() == "0 moved, 1 pending, 0 skipped"
+    assert kb_main(["move", "a", "--graph", str(graph)]) == 1
+    assert "pairs of node ids" in capsys.readouterr().err
+
+
 
 # -- E2E report regressions (task C1) -----------------------------------------
 def raw_request(srv, head: str, body: bytes = b"", host: str | None = None) -> tuple[int, dict, bytes]:

@@ -2100,8 +2100,8 @@ class KnowledgeBase:
           the next graphify rebuild.  An undo removes the move.
         - ``moved``: the graph has the new code, so the records follow now.
           The code moved, so an undo keeps them at the new id.
-        - ``skipped``: the graph has neither node and the overlay has no
-          records of ``old``.  Nothing changes.
+        - ``skipped``: the graph does not have ``old`` and the overlay has no
+          records of it.  Nothing changes.
         """
         old, new = str(old or ""), str(new or "")
         if not old or not new:
@@ -2116,12 +2116,12 @@ class KnowledgeBase:
             moves = ov["moved_nodes"]
             if old in self._nodes or old in moves.values():
                 status = "pending"
+            elif not _has_records(old, ov["patches"], ov["deleted_nodes"], ov["edges"]):
+                return {"from": old, "to": new, "status": "skipped"}
             elif _move_target(old, {**moves, old: new}, self._nodes) is not None:
                 status = "moved"
-            elif _has_records(old, ov["patches"], ov["deleted_nodes"], ov["edges"]):
-                status = "pending"
             else:
-                return {"from": old, "to": new, "status": "skipped"}
+                status = "pending"
             self._p_put_overlay("moved_nodes", old, new)
             return {"from": old, "to": new, "status": status}
 

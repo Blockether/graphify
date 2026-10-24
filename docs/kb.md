@@ -69,7 +69,12 @@ Nodes that you add get ids that start with `kb:`. Document nodes start with `doc
 
 An edit of an extracted node keeps the file, the label and the class of that node. A KB edge keeps them for each extracted end node. When a rebuild gives the node a new id, the edit and the edge move to the new id. graphify looks for one node with the same file, label and class. When the file was moved or renamed, one node with that label and class in the whole graph also counts. Otherwise the record waits, and the `stale_overlay_patch` or `stale_overlay_edge` finding names it.
 
-A rename changes the label, so this search cannot find the node. After a rename, send `{"op": "move_node", "from": "<old id>", "to": "<new id>"}` to `POST /api/batch`. The edits, edges and deletions of the old id then move to the new id. While the graph still has the old id, the move waits for the next rebuild (`"status": "pending"`). When the graph has the new code already, the records move at once (`"moved"`). An undo removes a move that waits, but records that moved stay at the new id.
+A rename changes the label, so this search cannot find the node. After a rename, send `{"op": "move_node", "from": "<old id>", "to": "<new id>"}` to `POST /api/batch`. Without a server, run `graphify kb move <old id> <new id>`; it takes more pairs too. The edits, edges and deletions of the old id then move to the new id. While the graph still has the old id, the move waits for the next rebuild (`"status": "pending"`). When the graph has the new code already, the records move at once (`"moved"`). When the graph does not have the old id and no record names it, nothing changes (`"skipped"`). An undo removes a move that waits, but records that moved stay at the new id.
+
+```bash
+graphify kb move app_old_name app_new_name        # after a rename
+graphify kb move lib_util_parse lib_text_parse --json
+```
 
 graphify keeps one edge between two nodes. If an edge already joins two nodes, a second edge between them fails with a conflict. Change the existing edge instead.
 

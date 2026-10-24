@@ -531,6 +531,8 @@ def test_move_node_undo_skip_and_refusals(kb):
     assert kb.overlay["moved_nodes"] == {}
     entries = len(kb.history)
     assert kb.move_node("gone", "elsewhere")["status"] == "skipped"
+    # The graph has the new id and no record names the old id: nothing follows.
+    assert kb.move_node("gone", "a")["status"] == "skipped"
     assert len(kb.history) == entries and kb.overlay["moved_nodes"] == {}
     lease = kb.add_node("Lease", cls="concept")["id"]
     with pytest.raises(KBError, match="knowledge-base node"):

@@ -5,6 +5,7 @@
     graphify kb validate [graph.json] [--limit N] [--json] [--strict]
     graphify kb infer    [graph.json] [--save] [--json]
     graphify kb ingest   <file|url>... [--graph graph.json] [--llm] [--title T] [--tag T] [--no-link]
+    graphify kb move     <old id> <new id> [<old id> <new id>]... [--graph graph.json] [--json]
 """
 from __future__ import annotations
 
@@ -67,6 +68,11 @@ def _parser() -> argparse.ArgumentParser:
     g.add_argument("--tag", action="append", default=[])
     g.add_argument("--no-link", action="store_true", help="do not link mentions of known nodes")
     g.add_argument("--json", action="store_true")
+
+    m = sub.add_parser("move", help="move the records of renamed or moved code nodes to their new ids")
+    m.add_argument("ids", nargs="+", metavar="ID", help="pairs of an old and a new node id")
+    m.add_argument("--graph")
+    m.add_argument("--json", action="store_true")
     return p
 
 
@@ -146,6 +152,20 @@ def main(argv: list[str] | None = None) -> int:
             kb.flush()
             if args.json:
                 print(json.dumps(results, indent=2, default=str))
+            return 0
+        if args.action == "move":
+            if len(args.ids) % 2:
+                raise KBError("move takes pairs of node ids: <old id> <new id> [<old id> <new id>]...")
+            kb = KnowledgeBase(_graph(args.graph), create=False)
+            pairs = zip(args.ids[::2], args.ids[1::2])
+            results = kb.batch([{"op": "move_node", "from": old, "to": new} for old, new in pairs], actor="cli")
+            kb.flush()
+            if args.json:
+                print(json.dumps(results, indent=2))
+            else:
+                counts = {status: sum(1 for res in results if res["status"] == status)
+                          for status in ("moved", "pending", "skipped")}
+                print(", ".join(f"{n} {status}" for status, n in counts.items()))
             return 0
     except (KBError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
