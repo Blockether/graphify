@@ -107,6 +107,39 @@ def test_publish_stays_inside_output_folder(server):
     assert call(server, "POST", "/api/publish", {"path": "../outside.html"})[0] == 400
 
 
+def test_export_copies_the_store(server, tmp_path):
+    assert call(server, "POST", "/api/nodes", {"label": "Billing", "class": "concept"})[0] == 201
+    status, doc = call(server, "POST", "/api/documents", {"title": "Ops", "body": "See [[Billing]]."})
+    png = base64.b64encode(b"\x89PNG data").decode()
+    assert call(server, "POST", f"/api/documents/{doc['id']}/assets", {"name": "x.png", "data_base64": png})[0] == 201
+    status, export = call(server, "GET", "/api/export")
+    assert status == 200 and export["format"] == "graphify-kb-export" and export["version"] == server.kb.version
+    paths = {f["path"] for f in export["files"]}
+    base = f"kb/documents/{doc['id']}"
+    assert {"graph.json", "kb/overlay.json", f"{base}/meta.json", f"{base}/body.md"} <= paths
+    # The history and the assets stay out; an inferred ontology has no file.
+    assert not any("/assets/" in p or "history" in p for p in paths)
+    assert server.kb.stats()["ontology_inferred"] and "ontology.json" not in paths
+    status, full = call(server, "GET", "/api/export?assets=1")
+    asset = [f for f in full["files"] if f["path"] == f"{base}/assets/x.png"]
+    assert asset and base64.b64decode(asset[0]["base64"]) == b"\x89PNG data"
+    copy = tmp_path / "copy"
+    for f in full["files"]:
+        target = copy / f["path"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if "json" in f:
+            target.write_text(json.dumps(f["json"]), encoding="utf-8")
+        elif "text" in f:
+            target.write_text(f["text"], encoding="utf-8")
+        else:
+            target.write_bytes(base64.b64decode(f["base64"]))
+    copied = KnowledgeBase(copy / "graph.json", create=False)
+    keys = ("nodes", "edges", "documents", "kb_nodes", "kb_edges")
+    assert [copied.stats()[k] for k in keys] == [server.kb.stats()[k] for k in keys]
+    assert copied.get_document(doc["id"])["body"] == "See [[Billing]]."
+    assert copied.asset_path(doc["id"], "x.png").read_bytes() == b"\x89PNG data"
+
+
 def test_read_only_server_refuses_writes(tmp_path):
     kb = KnowledgeBase(make_graph(tmp_path), autoflush=False)
     srv = KBServer(kb, "127.0.0.1", 0, read_only=True)

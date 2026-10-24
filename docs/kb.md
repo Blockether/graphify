@@ -366,6 +366,7 @@ This section is a reference for agents and scripts. All routes return JSON.
 | `POST /api/ingest` | Add a file, text or web page. See [Ingest](#ingest). |
 | `GET /api/history?limit=`, `POST /api/undo` | History, and undo of the latest change or of `{"seq": N}`. |
 | `POST /api/publish` | Write the static page. See [Static export](#static-export). |
+| `GET /api/export?assets=1` | The files of the store, for a copy. See [Copy a store](#copy-a-store). |
 | `POST /api/flush` | Write pending changes to `graph.json` now. |
 | `GET /api/events` | Server-sent events for each change. |
 | `POST /api/login`, `POST /api/logout` | Start or end a browser session. See [Security](#security). |
@@ -440,6 +441,24 @@ The answer is `200` with the document. The name is no longer in `possible`, and 
 `GET /api/community/<id>` answers `version`, `id`, `name`, `nodes`, `edges`, `relations` and `boundary`. The `nodes` rows have the format of `/api/graph`. `boundary` lists edges to other communities, at most 2,000. `boundary_total` and `boundary_truncated` tell you when the list is cut.
 
 On the 47,817-node Vis graph, the overview is 126 KB with gzip, and the largest community is 24 KB. The full `/api/graph` is 1.68 MB.
+
+### Copy a store
+
+`GET /api/export` answers the files of the store, so that you can copy it to another folder or machine:
+
+```json
+{"format": "graphify-kb-export", "version": 42, "exported_at": "2026-10-24T09:12:03Z",
+ "files": [{"path": "graph.json", "json": {"nodes": [], "links": []}},
+           {"path": "kb/overlay.json", "json": {"nodes": {}, "edges": {}}},
+           {"path": "kb/documents/notes/meta.json", "text": "{...}"},
+           {"path": "kb/documents/notes/body.md", "text": "# Notes"}]}
+```
+
+- Each `path` is relative to the output folder. Write each file there to make a copy. Then `graphify kb serve copy/graph.json --read-only` serves it.
+- A JSON file comes as `json`, a text file as `text`.
+- `ontology.json` is in the list only when the store has one. Without it, the copy infers the same ontology.
+- `assets=1` adds the files of the documents in base64, such as `{"path": "kb/documents/notes/assets/plan.png", "base64": "..."}`. Without it, the answer is smaller, but the copy has no images or attachments.
+- The history, the trash and the lock stay out. A copy starts with an empty history.
 
 ### Caching
 

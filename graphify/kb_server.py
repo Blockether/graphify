@@ -1037,6 +1037,8 @@ class KBHandler(BaseHTTPRequestHandler):
             target = publish_target(kb, data.get("path"))
             target = write_static_html(kb, target)
             self._json(200, {"path": str(target), "bytes": target.stat().st_size})
+        elif head == "export" and method == "GET":
+            self._json(200, kb.export_store(assets=q.get("assets") == "1"))
         elif head == "flush" and method == "POST":
             self._json(200, {"written": kb.flush()})
         else:

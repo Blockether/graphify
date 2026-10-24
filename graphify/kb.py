@@ -20,6 +20,7 @@ operations that undo it.
 
 from __future__ import annotations
 
+import base64
 import copy
 import errno
 import hashlib
@@ -1834,6 +1835,38 @@ class KnowledgeBase:
                 "ontology_inferred": self.ontology_inferred,
                 "history": len(self.history),
             }
+
+    def export_store(self, *, assets: bool = False) -> dict[str, Any]:
+        """Return the files of the store, for a copy in another folder or on another machine.
+
+        ``files`` holds ``graph.json``, ``kb/overlay.json``, ``ontology.json``
+        when the store has one, and the ``meta.json`` and ``body.md`` of each
+        document. With ``assets``, it also holds the document files in base64.
+        Each path is relative to the output folder.  A JSON file comes as
+        ``json``, a text file as ``text`` and an asset as ``base64``.  The
+        history, the trash and the lock stay out: a copy starts its own history.
+        """
+        with self._lock:
+            files: list[dict[str, Any]] = [
+                {"path": "graph.json", "json": json.loads(json.dumps(self.data, default=str))},
+                {"path": "kb/overlay.json", "json": json.loads(json.dumps(self.overlay, default=str))},
+            ]
+            if not self.ontology_inferred and self.onto_path.is_file():
+                files.append({"path": "ontology.json", "text": self.onto_path.read_text(encoding="utf-8")})
+            folders = sorted(self.docs_dir.iterdir()) if self.docs_dir.is_dir() else []
+            for folder in folders:
+                if not folder.is_dir() or folder.name.startswith(".") or not (folder / "meta.json").is_file():
+                    continue
+                base = f"kb/documents/{folder.name}"
+                for name in ("meta.json", "body.md"):
+                    if (folder / name).is_file():
+                        files.append({"path": f"{base}/{name}", "text": (folder / name).read_text(encoding="utf-8")})
+                if assets and (folder / "assets").is_dir():
+                    for item in sorted((folder / "assets").iterdir()):
+                        if item.is_file() and not item.name.startswith("."):
+                            data = base64.b64encode(item.read_bytes()).decode("ascii")
+                            files.append({"path": f"{base}/assets/{item.name}", "base64": data})
+            return {"format": "graphify-kb-export", "version": self.version, "exported_at": now_iso(), "files": files}
 
     def graph_view(self) -> dict[str, Any]:
         """Return a compact graph for the viewer.
