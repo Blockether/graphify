@@ -13,6 +13,7 @@ from graphify.kb import (
     UndoConflict,
     apply_overlay,
     edge_id,
+    move_document_ids,
     patch_anchor,
 )
 from graphify.kb_html import render_static_html, write_static_html
@@ -555,6 +556,55 @@ def test_moves_follow_a_chain_and_drop_a_revert():
     overlay = _overlay(patches={"a": {"owner": "team"}}, moved_nodes={"a": "b", "b": "a"})
     apply_overlay(data, overlay)
     assert overlay["moved_nodes"] == {} and data["nodes"][0]["owner"] == "team"
+
+
+@pytest.mark.parametrize("pending", [True, False], ids=["before-rebuild", "after-rebuild"])
+def test_documents_follow_a_moved_node(tmp_path, pending):
+    # A document kept the old id after a move.  Its next change then dropped
+    # the mentions edge that had moved to the new id.
+    graph = make_graph(tmp_path)
+    base = json.loads(graph.read_text(encoding="utf-8"))
+    store = KnowledgeBase(graph)
+    doc = store.create_document("Notes", nodes=["a"])
+    move = [{"op": "move_node", "from": "a", "to": "a_v2"}]
+    if pending:
+        assert store.batch(move)[0]["status"] == "pending"
+    _rebuild(graph, base, {"a": {"id": "a_v2", "label": "AlphaV2"}})
+    store.refresh_if_changed()
+    if not pending:
+        assert store.batch(move)[0]["status"] == "moved"
+    assert store.get_document(doc["id"])["nodes"] == ["a_v2"]
+    store.update_document(doc["id"], tags=["notes"])
+    assert edge_id(doc["node_id"], "a_v2", "mentions") in store.overlay["edges"]
+
+
+def test_documents_follow_a_file_rename(tmp_path):
+    # The anchor of the mentions edge finds the node, and the document follows the edge.
+    graph = make_graph(tmp_path)
+    base = json.loads(graph.read_text(encoding="utf-8"))
+    store = KnowledgeBase(graph)
+    doc = store.create_document("Notes", nodes=["a"])["id"]
+    _rebuild(graph, base, {"a": {"id": "src_a", "source_file": "src/a.py"}, "r": {"source_file": "src/a.py"}})
+    store.refresh_if_changed()
+    assert store.get_document(doc)["linked"] == [{"id": "src_a", "label": "Alpha", "exists": True}]
+
+
+def test_move_document_ids_moves_every_node_id_of_a_document():
+    meta = {
+        "nodes": ["a", "b"], "wiki_nodes": ["c"], "auto_nodes": ["x", "b"], "llm_nodes": [],
+        "auto_scores": {"x": 0.4, "b": 0.9, "a": 0.7},
+        "decisions": {"alpha": "a", "noise": None},
+        "possible": [{"mention": "Alpha", "candidates": [
+            {"id": "a", "label": "Alpha", "source_file": "a.py"}, {"id": "q", "label": "Q"}]}],
+    }
+    nodes = {"a2": {"label": "AlphaV2", "source_file": "src/a.py"}}
+    assert move_document_ids(meta, {"a": "a2", "x": "b"}, nodes)
+    assert (meta["nodes"], meta["wiki_nodes"], meta["auto_nodes"]) == (["a2", "b"], ["c"], ["b"])
+    assert meta["auto_scores"] == {"b": 0.9, "a2": 0.7}  # b keeps its own score
+    assert meta["decisions"] == {"alpha": "a2", "noise": None}
+    assert meta["possible"][0]["candidates"] == [
+        {"id": "a2", "label": "AlphaV2", "source_file": "src/a.py"}, {"id": "q", "label": "Q"}]
+    assert not move_document_ids(meta, {"gone": "z"}, nodes)
 
 
 def test_undo_uses_the_footprint_from_write_time(tmp_path):

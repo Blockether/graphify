@@ -329,6 +329,9 @@ def apply_overlay(
       (``rekeyed_patches``).  A patch without a node stays out (``stale_patches``).
     - An overlay edge follows its end nodes the same way (see ``EDGE_ANCHOR``
       and ``rekeyed_edges``).
+    - ``moved_ids`` maps each old node id whose records went to a new id, by a
+      move or an anchor, to that id.  Documents name their nodes by id, so the
+      store sends them there too (``move_document_ids``).
 
     The overlay keeps the records that stay out, so they come back when the
     graph has their nodes again.  Return the counts of the changes, and the ids
@@ -361,6 +364,7 @@ def apply_overlay(
         applied_moves, moves_changed = _apply_moves(
             moves, nodes, links, patches, deleted_nodes, ov_edges, deleted_edges
         )
+    moved_ids = {move["from"]: move["to"] for move in applied_moves}
 
     by_id: dict[str, dict[str, Any]] = {}
     removed: set[str] = set()
@@ -410,6 +414,7 @@ def apply_overlay(
             del patches[nid]
             patches[new_id] = patch
             rekeyed.append({"from": nid, "to": new_id})
+            moved_ids.setdefault(nid, new_id)
             node = by_id[new_id]
             _refresh_anchor(patch, node)
         elif PATCH_ANCHOR not in patch:
@@ -471,6 +476,9 @@ def apply_overlay(
             rec["source"], rec["target"] = ends
             ov_edges[new_eid] = rec
             rekeyed_edges.append({"from": eid, "to": new_eid})
+            for old_end, new_end in zip((s, t), ends):
+                if old_end != new_end:
+                    moved_ids.setdefault(old_end, new_end)
             eid, (s, t) = new_eid, ends
         edges_anchored += int(_anchor_edge(rec, by_id, patches, refresh))
         clean = {k: v for k, v in rec.items() if k != EDGE_ANCHOR}
@@ -503,6 +511,7 @@ def apply_overlay(
         "rekeyed_patches": sorted(rekeyed, key=lambda r: r["from"]),
         "rekeyed_edges": sorted(rekeyed_edges, key=lambda r: r["from"]),
         "applied_moves": applied_moves,
+        "moved_ids": dict(sorted(moved_ids.items())),
         "overlay_changed": bool(moves_changed or rekeyed or anchored or rekeyed_edges or edges_anchored),
     }
 
@@ -809,13 +818,63 @@ def _apply_moves(
     return [{"from": old, "to": new} for old, new in sorted(resolved.items())], changed or bool(resolved)
 
 
+# The keys of a document meta that list the linked node ids.
+DOC_LINK_KEYS = ("nodes", "wiki_nodes", "auto_nodes", "llm_nodes")
+
+
+def move_document_ids(
+    meta: dict[str, Any], moved: dict[str, str], nodes: dict[str, dict[str, Any]]
+) -> bool:
+    """Send the node ids of document ``meta`` to their new ids in ``moved``.
+
+    ``moved`` is the ``moved_ids`` result of ``apply_overlay``.  The links, the
+    text-link scores, the link decisions and the review candidates follow.  A
+    candidate takes the label and the file of its new node from ``nodes``.
+    Two old ids of one new id give one link.  Return True when ``meta`` changed.
+    """
+    changed = False
+    for key in DOC_LINK_KEYS:
+        ids = meta.get(key)
+        if isinstance(ids, list) and any(str(nid) in moved for nid in ids):
+            meta[key] = list(dict.fromkeys(moved.get(str(nid), str(nid)) for nid in ids))
+            changed = True
+    scores = meta.get("auto_scores")
+    if isinstance(scores, dict) and any(nid in moved for nid in scores):
+        kept: dict[str, Any] = {}
+        for nid, score in scores.items():
+            new = moved.get(nid, nid)
+            if new == nid or new not in kept:
+                kept[new] = score  # the new id keeps its own score
+        meta["auto_scores"] = kept
+        changed = True
+    decisions = meta.get("decisions")
+    if isinstance(decisions, dict) and any(nid in moved for nid in decisions.values() if isinstance(nid, str)):
+        meta["decisions"] = {
+            key: moved.get(nid, nid) if isinstance(nid, str) else nid for key, nid in decisions.items()
+        }
+        changed = True
+    for item in meta.get("possible") or ():
+        cands = item.get("candidates") if isinstance(item, dict) else None
+        for cand in cands if isinstance(cands, list) else ():
+            new = moved.get(str(cand.get("id"))) if isinstance(cand, dict) else None
+            if new is None:
+                continue
+            cand["id"] = new
+            node = nodes.get(new) or {}
+            for attr in ("label", "source_file"):
+                if attr in cand and node.get(attr) is not None:
+                    cand[attr] = node[attr]
+            changed = True
+    return changed
+
+
 # Keys of the ``apply_overlay`` result that do not count graph changes: the
 # records that stay out and the overlay bookkeeping.
 OVERLAY_SKIP_KEYS = frozenset(
     {
         "conflicts", "dangling", "stale_patches", "conflict_edges", "dangling_edges",
         "stale_patch_nodes", "rekeyed_patches", "patches_anchored", "rekeyed_edges",
-        "edges_anchored", "applied_moves", "overlay_changed",
+        "edges_anchored", "applied_moves", "moved_ids", "overlay_changed",
     }
 )
 
@@ -1048,13 +1107,16 @@ class KnowledgeBase:
             self.overlay = self._read_overlay()
             stats = apply_overlay(self.data, self.overlay, links_key=self.links_key)
             self.overlay_stats = stats
+            self._reindex()
+            # The documents follow first: when a crash stops the overlay write,
+            # the next load moves the records and the documents again.
+            self._move_doc_links(stats["moved_ids"])
             if stats["overlay_changed"] and self.overlay_path.is_file():
                 # Keep the new ids, anchors and applied moves, so the next load
                 # finds them at once.  The caller holds the store lock.
                 _dump_atomic(self.overlay_path, self.overlay)
                 sig["overlay"] = _file_stat(self.overlay_path)
             changed = any(v for k, v in stats.items() if k not in OVERLAY_SKIP_KEYS)
-            self._reindex()
             self.ontology_inferred = False
             onto = load_ontology(self.onto_path)
             if onto is None:
@@ -1315,15 +1377,16 @@ class KnowledgeBase:
         """Apply the node moves whose old node the graph lost (``move_node``).
 
         The graph in memory holds the overlay already, so the overlay applies
-        again in place and only the moved records change.  This runs after the
-        change, outside its undo log: the code moved, so an undo keeps the
-        records at their new ids.
+        again in place and only the moved records and document links change.
+        This runs after the change, outside its undo log: the code moved, so an
+        undo keeps the records and the document links at their new ids.
         """
         moves = self.overlay["moved_nodes"]
         if not any(old not in self._nodes and _move_target(old, moves, self._nodes) for old in moves):
             return
         self.overlay_stats = apply_overlay(self.data, self.overlay, links_key=self.links_key)
         self._reindex()
+        self._move_doc_links(self.overlay_stats["moved_ids"])
 
     def _p_put_ontology(self, onto: Ontology) -> None:
         before = None if self.ontology_inferred else self.ontology.to_dict()
@@ -2618,11 +2681,32 @@ class KnowledgeBase:
 
     def _doc_links(self, meta: dict[str, Any]) -> list[str]:
         seen: list[str] = []
-        for key in ("nodes", "wiki_nodes", "auto_nodes", "llm_nodes"):
+        for key in DOC_LINK_KEYS:
             for nid in meta.get(key) or []:
                 if nid not in seen:
                     seen.append(str(nid))
         return seen
+
+    def _move_doc_links(self, moved: dict[str, str]) -> None:
+        """Send the node ids of every document to their new ids in ``moved``.
+
+        ``moved`` is the ``moved_ids`` result of ``apply_overlay``, so the
+        mentions edges of the documents went there already.  A re-link reads
+        the ids in the meta and drops the edges of other nodes, so the meta
+        follows the edges.  This writes outside the undo log, like the moved
+        records.  The caller holds the store lock.
+        """
+        if not moved or not self.docs_dir.is_dir():
+            return
+        for folder in sorted(self.docs_dir.iterdir()):
+            if not folder.is_dir() or folder.name.startswith("."):
+                continue
+            try:
+                meta = self._read_meta(folder.name)
+            except NotFound:
+                continue  # not a document folder
+            if meta and move_document_ids(meta, moved, self._nodes):
+                _dump_atomic(folder / "meta.json", meta)
 
     def _link_index(self) -> LinkIndex:
         """Return the entity-linking index of the graph, rebuilt once per version."""
