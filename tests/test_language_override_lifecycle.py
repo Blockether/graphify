@@ -1,6 +1,7 @@
 """Language declarations must invalidate incremental state and reach watch events."""
 import hashlib
 import json
+import sys
 import threading
 from pathlib import Path
 
@@ -139,12 +140,15 @@ def drive_watch(root, monkeypatch, actions, *, observed_roots=None):
     steps = iter(actions)
     real_sleep = watch_mod.time.sleep
     watcher = threading.current_thread()
+    loop = watch_mod.watch.__code__
 
     def pump(seconds):
-        # The patch replaces time.sleep in the whole process. A thread that an
-        # earlier test left on this xdist worker gets the real sleep, so it
-        # cannot take the events of this test.
-        if threading.current_thread() is not watcher:
+        # The patch replaces time.sleep in the whole process. Only the sleep of
+        # the watch loop on this thread takes the next event. A thread that an
+        # earlier test left on this xdist worker, or a wait inside the rebuild
+        # (the subprocess poll of `git rev-parse`), gets the real sleep.
+        caller = sys._getframe(1).f_code
+        if threading.current_thread() is not watcher or caller is not loop:
             return real_sleep(seconds)
         try:
             event = next(steps)()
