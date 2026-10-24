@@ -1283,16 +1283,16 @@ def _duplicate_findings(onto: Ontology, ids: dict[str, dict[str, Any]], cls_of: 
     """
     if not kb_ids:
         return []
-    wanted = {graph_norm_label(ids[nid].get("label")) for nid in kb_ids} - {""}
+    norms = {nid: graph_norm_label(node.get("label")) for nid, node in ids.items()}
+    wanted = {norms[nid] for nid in kb_ids} - {""}
     by_norm: dict[str, list[str]] = defaultdict(list)
-    for nid, node in ids.items():
-        key = graph_norm_label(node.get("label"))
+    for nid, key in norms.items():
         if key in wanted:
             by_norm[key].append(nid)
     out: list[dict[str, Any]] = []
     reported: set[frozenset[str]] = set()
     for nid in sorted(kb_ids):
-        key = graph_norm_label(ids[nid].get("label"))
+        key = norms[nid]
         others = [o for o in by_norm.get(key, ()) if o != nid and o not in kb_neighbours[nid] and _candidate(onto, ids[o], cls_of[o]) and _compatible(onto, cls_of[nid], cls_of[o])]
         group = frozenset([nid, *others])
         if not others or group in reported:

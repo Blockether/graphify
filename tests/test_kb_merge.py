@@ -245,10 +245,10 @@ def test_update_drops_a_kb_node_that_the_overlay_removed(tmp_path):
     kb.flush()
     assert concept["id"] in _graph(graph_path)[0]
 
-    overlay_path = graph_path.parent / "kb" / "overlay.json"
-    overlay = json.loads(overlay_path.read_text(encoding="utf-8"))
+    # A written kb/overlay.json is an import: the store and the rebuild read it.
+    overlay = read_overlay(graph_path.parent)
     del overlay["nodes"][concept["id"]]
-    overlay_path.write_text(json.dumps(overlay), encoding="utf-8")
+    (graph_path.parent / "kb" / "overlay.json").write_text(json.dumps(overlay), encoding="utf-8")
 
     app.write_text("def run():\n    return 1\n\n\ndef stop():\n    return 0\n", encoding="utf-8")
     assert _rebuild_code(corpus, acquire_lock=False) is True

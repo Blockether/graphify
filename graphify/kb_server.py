@@ -52,6 +52,7 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from graphify.kb import MAX_ASSET_BYTES, KBError, KnowledgeBase, NotFound
+from graphify.kb_store import dumps as dumps_json
 
 UI_DIR = Path(__file__).with_name("kb_ui")
 # A JSON upload carries base64 (4/3 of the size), so the largest asset must fit.
@@ -87,6 +88,10 @@ _DIGITS_RE = re.compile(r"[0-9]+")
 # A new server process can run new code that builds the views differently
 # (for example new ontology classes), so each process start gives new ETags.
 _BOOT_TOKEN = f"{time.time_ns():x}"
+# The store keeps each change at once; graph.json only makes the next load
+# fast.  During a run of edits, the flush loop writes it at most once in this
+# many intervals.
+FLUSH_MAX_WAIT = 10
 
 
 # Client libraries of outside services (LLM backends). A connection or timeout
@@ -160,22 +165,18 @@ def kb_etag(kb: KnowledgeBase) -> str:
     """Return a weak ETag for the current state of ``kb``.
 
     ``kb.version`` alone repeats after a restart or for another graph on the
-    same port, so the tag also covers the graph path, the graph file time,
-    the history length and the ontology file time.  It also covers the
-    server process, because a restart can load code that builds the views
-    differently from the same files.
+    same port, so the tag also covers the graph path, the history length and
+    newest seq, the store commit counter and the ontology file time.  It also
+    covers the server process, because a restart can load code that builds
+    the views differently from the same files.
     """
     with kb._lock:
-        history = kb.history
-        last = history[-1].get("seq") if history else 0
-        files = []
-        for path in (kb.onto_path, kb.overlay_path):
-            try:
-                files.append(path.stat().st_mtime_ns)
-            except OSError:
-                files.append(0)
-        parts = (_BOOT_TOKEN, str(kb.graph_path), kb.version, getattr(kb, "_graph_mtime", None),
-                 len(history), last, *files)
+        count, last = kb.history_state()
+        try:
+            onto = kb.onto_path.stat().st_mtime_ns
+        except OSError:
+            onto = 0
+        parts = (_BOOT_TOKEN, str(kb.graph_path), kb.version, count, last, kb._store.seq(), onto)
     digest = hashlib.sha256(repr(parts).encode()).hexdigest()[:20]
     return f'W/"{digest}"'
 
@@ -510,10 +511,18 @@ class KBServer(ThreadingHTTPServer):
         return False
 
     def _flush_loop(self, interval: float) -> None:
+        # Write graph.json after one quiet interval, so a run of edits does
+        # not write the whole graph after each edit.
+        seen, busy = self.kb.version, 0
         while not self._stop.wait(interval):
             try:
-                self.kb.flush()
                 self.kb.refresh_if_changed()
+                version = self.kb.version
+                busy = busy + 1 if version != seen else 0
+                seen = version
+                if busy == 0 or busy >= FLUSH_MAX_WAIT:
+                    self.kb.flush()
+                    busy = 0
             except Exception:
                 pass
 
@@ -611,7 +620,7 @@ class KBHandler(BaseHTTPRequestHandler):
             self._drain(int(text))
 
     def _json(self, status: int, data: Any, headers: dict[str, str] | None = None) -> None:
-        body = json.dumps(data, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+        body = dumps_json(data)
         self._send(status, body, "application/json; charset=utf-8", headers)
 
     def _error(self, status: int, message: str) -> None:
@@ -957,7 +966,7 @@ class KBHandler(BaseHTTPRequestHandler):
         if value is not None:
             # graph_view() builds new lists for each version and never changes them,
             # so the encoding can run outside the lock.
-            body = json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+            body = dumps_json(value)
             hit = (etag, body, None)
             with kb._lock:
                 for old in [k for k, v in cache.items() if v[0] != etag]:
@@ -1038,7 +1047,7 @@ class KBHandler(BaseHTTPRequestHandler):
             target = write_static_html(kb, target)
             self._json(200, {"path": str(target), "bytes": target.stat().st_size})
         elif head == "export" and method == "GET":
-            self._json(200, kb.export_store(assets=q.get("assets") == "1"))
+            self._send(200, kb.export_json(assets=q.get("assets") == "1"), "application/json; charset=utf-8")
         elif head == "flush" and method == "POST":
             self._json(200, {"written": kb.flush()})
         else:
@@ -1337,8 +1346,9 @@ def serve(
     kb = KnowledgeBase(graph_path, autoflush=False)
     server = KBServer(kb, host, port, token=token, read_only=read_only, allowed_hosts=allowed_hosts)
     restore = _stop_on_signals(server)
-    stats = kb.stats()
-    print(f"graphify knowledge base: {stats['nodes']} nodes, {stats['edges']} edges, {stats['documents']} documents", flush=True)
+    counts = kb.counts()
+    print(f"graphify knowledge base: {counts['nodes']} nodes, {counts['edges']} edges, "
+          f"{counts['documents']} documents", flush=True)
     print(f"Serving {kb.graph_path} at {server.url}", flush=True)
     if token:
         print("Token auth is on.", flush=True)

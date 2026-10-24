@@ -15,6 +15,7 @@ from graphify.kb import (
     edge_id,
     move_document_ids,
     patch_anchor,
+    read_overlay,
 )
 from graphify.kb_html import render_static_html, write_static_html
 from tests.kb_fixtures import make_graph
@@ -431,7 +432,7 @@ def test_kb_rekeys_a_patch_after_a_rename_and_keeps_it(tmp_path):
     assert store.get_node("src_a")["node"]["owner"] == "team"
     found = [f for f in store.validate()["findings"] if f["code"] == "rekeyed_overlay_patch"]
     assert [(f["from"], f["node"], f["severity"]) for f in found] == [("a", "src_a", "info")]
-    stored = json.loads((graph.parent / "kb" / "overlay.json").read_text(encoding="utf-8"))
+    stored = read_overlay(graph.parent)
     assert list(stored["patches"]) == ["src_a"]
 
 
@@ -468,7 +469,7 @@ def test_kb_edge_follows_a_file_rename(tmp_path):
     assert any(x["source"] == lease and x["target"] == "src_a" for x in store.data["links"])
     found = [f for f in store.validate()["findings"] if f["code"] in ("rekeyed_overlay_edge", "stale_overlay_edge")]
     assert [(f["code"], f["from"], f["edge"]["id"]) for f in found] == [("rekeyed_overlay_edge", old_eid, new_eid)]
-    stored = json.loads((graph.parent / "kb" / "overlay.json").read_text(encoding="utf-8"))
+    stored = read_overlay(graph.parent)
     assert list(stored["edges"]) == [new_eid]
     assert stored["edges"][new_eid][EDGE_ANCHOR]["target"]["source_file"] == "src/a.py"
     store.flush()
@@ -499,7 +500,7 @@ def test_move_node_waits_for_the_rebuild_and_moves_every_record(tmp_path):
     codes = {f["code"] for f in store.validate()["findings"]}
     assert "moved_overlay_node" in codes and "pending_overlay_move" not in codes
     assert not {"stale_overlay_patch", "stale_overlay_edge"} & codes
-    stored = json.loads((graph.parent / "kb" / "overlay.json").read_text(encoding="utf-8"))
+    stored = read_overlay(graph.parent)
     assert stored["moved_nodes"] == {} and list(stored["patches"]) == ["a_v2"]
     assert stored["patches"]["a_v2"][PATCH_ANCHOR]["label"] == "AlphaV2"
     assert edge_id("r", "a_v2", "rationale_for") in stored["deleted_edges"]

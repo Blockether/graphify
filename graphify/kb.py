@@ -1,6 +1,7 @@
 """Editable knowledge base over a graphify ``graph.json``.
 
-The knowledge base keeps every edit in ``graphify-out/kb/overlay.json``:
+The knowledge base keeps every edit in the overlay of ``graphify-out/kb/store.sqlite``
+(see ``graphify.kb_store``):
 
 - nodes and edges that it created or changed;
 - attribute patches for nodes that the extractor created;
@@ -8,14 +9,17 @@ The knowledge base keeps every edit in ``graphify-out/kb/overlay.json``:
 
 ``graph.json`` is the materialised result.  When ``graphify update`` rebuilds
 the graph, the next load applies the overlay again, so manual knowledge stays.
+A load of an unchanged ``graph.json`` skips that step: the store records the
+state of the ``graph.json`` that holds the whole overlay.
 
 Documents ("boxes") live in ``graphify-out/kb/documents/<id>/`` with a
 markdown ``body.md``, ``meta.json`` and an ``assets/`` folder for images, PDFs
 and other attachments.  Each document is also a ``document`` node in the graph
 with ``mentions`` edges to the nodes that it names.
 
-Every change is one history entry in ``kb/history.jsonl`` with the primitive
-operations that undo it.
+Every change is one history entry in the store with the primitive operations
+that undo it.  A store from before ``store.sqlite`` keeps ``kb/overlay.json``
+and ``kb/history.jsonl``: the first load moves them into the store.
 """
 
 from __future__ import annotations
@@ -29,14 +33,19 @@ import mimetypes
 import os
 import re
 import shutil
+import sqlite3
 import sys
 import tempfile
 import threading
 import time
+from array import array
+from bisect import bisect_right
 from collections import Counter
 from contextlib import contextmanager
+from itertools import accumulate
+from operator import methodcaller
 from pathlib import Path
-from typing import Any, Callable, Iterator, TextIO
+from typing import Any, BinaryIO, Callable, Iterable, Iterator
 
 from graphify.ontology import (
     MENTIONS,
@@ -60,6 +69,9 @@ from graphify.ontology import (
 from graphify.export import _CONFIDENCE_SCORE_DEFAULTS
 from graphify import kb_ingest
 from graphify.kb_ingest import safe_name, slugify
+from graphify.kb_store import STORE_FILE, HistoryView, Store, entry_from_blob, read_store_overlay
+from graphify.kb_store import dumps as _dumps_json
+from graphify.kb_store import loads as _loads_json
 from graphify.kb_link import LinkIndex, label_key, link_text, resolve_wiki, wiki_links
 from graphify.validate import VALID_CONFIDENCES, VALID_FILE_TYPES
 
@@ -191,41 +203,40 @@ def edge_id(source: Any, target: Any, relation: Any) -> str:
 
 # json.dump into a file always runs the pure-Python encoder: about three
 # times slower on a 64 MB graph, and the server flush holds the store lock
-# for that time (#8264).  JSONEncoder.encode runs the C encoder.  Long lists
-# go out in slices, so the whole graph is never one more string in memory.
-_JSON_COMPACT = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"))
+# for that time (#8264).  ``kb_store.dumps`` runs orjson, else the C encoder
+# of json.  Long lists go out in slices, so the whole graph is never one more
+# string in memory.
 _JSON_SLICE = 2000
 
 
-def _write_compact_json(fh: TextIO, data: Any) -> None:
-    """Write ``data`` as compact JSON, the same text as ``json.dumps``."""
+def _write_compact_json(fh: BinaryIO, data: Any) -> None:
+    """Write ``data`` as compact UTF-8 JSON, the same data as ``json.dumps``."""
     if not isinstance(data, dict) or not all(isinstance(k, str) for k in data):
-        fh.write(_JSON_COMPACT.encode(data))
+        fh.write(_dumps_json(data))
         return
-    fh.write("{")
+    fh.write(b"{")
     for i, (key, value) in enumerate(data.items()):
-        fh.write(("," if i else "") + _JSON_COMPACT.encode(key) + ":")
+        fh.write((b"," if i else b"") + _dumps_json(key) + b":")
         if isinstance(value, list) and len(value) > _JSON_SLICE:
-            fh.write("[")
+            fh.write(b"[")
             for start in range(0, len(value), _JSON_SLICE):
-                part = _JSON_COMPACT.encode(value[start : start + _JSON_SLICE])
-                fh.write(("," if start else "") + part[1:-1])
-            fh.write("]")
+                part = _dumps_json(value[start : start + _JSON_SLICE])
+                fh.write((b"," if start else b"") + part[1:-1])
+            fh.write(b"]")
         else:
-            fh.write(_JSON_COMPACT.encode(value))
-    fh.write("}")
+            fh.write(_dumps_json(value))
+    fh.write(b"}")
 
 
 def _dump_atomic(path: Path, data: Any, *, compact: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        with os.fdopen(fd, "wb") as fh:
             if compact:
                 _write_compact_json(fh, data)
             else:
-                json.dump(data, fh, ensure_ascii=False, indent=2)
-                fh.write("\n")
+                fh.write(json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8") + b"\n")
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -283,13 +294,26 @@ def is_kb_record(item: Any) -> bool:
 
 
 def read_overlay(out_dir: Path | str) -> dict[str, Any] | None:
-    """Return the overlay of the knowledge base in ``out_dir``, or None without one."""
+    """Return the overlay of the knowledge base in ``out_dir``, or None without one.
+
+    A ``kb/overlay.json`` comes first: an import or a store from before
+    ``kb/store.sqlite`` wrote it, and the next store load moves it in.
+    """
     path = Path(out_dir) / "kb" / "overlay.json"
-    if not path.is_file():
-        return None
+    if path.is_file():
+        return _read_legacy_overlay(path)
+    store = Path(out_dir) / "kb" / STORE_FILE
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        return read_store_overlay(store)
+    except (sqlite3.Error, ValueError) as exc:
+        raise KBError(f"cannot read {store}: {exc}") from exc
+
+
+def _read_legacy_overlay(path: Path) -> dict[str, Any]:
+    """Read an overlay from a ``kb/overlay.json`` file."""
+    try:
+        raw = _loads_json(path.read_bytes())
+    except (OSError, ValueError) as exc:
         raise KBError(f"cannot read {path}: {exc}") from exc
     overlay = _empty_overlay()
     if isinstance(raw, dict):
@@ -299,10 +323,39 @@ def read_overlay(out_dir: Path | str) -> dict[str, Any] | None:
     return overlay
 
 
-def _pair_key(source: str, target: str, directed: bool) -> tuple[str, str]:
-    if directed or source <= target:
-        return source, target
-    return target, source
+def _same(value: Any) -> Any:
+    return value
+
+
+def _key_set(table: Any) -> Any:
+    """Return the keys of ``table`` for many ``in`` tests.
+
+    A dict answers them itself.  A lazy table (``kb_store.OverlayTable``)
+    answers each test with a query, so it gives its keys once as a set.
+    """
+    return table if isinstance(table, dict) else set(table)
+
+
+def _joined(values: list[str]) -> tuple[str, array]:
+    """Join ``values`` with NUL and return the text and the start of each value.
+
+    The starts end with one more entry, so value ``i`` ends before
+    ``starts[i + 1] - 1``.
+    """
+    return "\x00".join(values), array("q", accumulate((len(v) + 1 for v in values), initial=0))
+
+
+def _scan(text: str, starts: array, query: str) -> dict[int, int]:
+    """Return ``{index: position}`` of the first ``query`` in each value of a ``_joined`` text."""
+    found: dict[int, int] = {}
+    if "\x00" in query:
+        return found
+    pos = text.find(query)
+    while pos >= 0:
+        i = bisect_right(starts, pos) - 1
+        found[i] = pos - starts[i]
+        pos = text.find(query, starts[i + 1])
+    return found
 
 
 def apply_overlay(
@@ -311,6 +364,7 @@ def apply_overlay(
     *,
     links_key: str | None = None,
     directed: bool | None = None,
+    copy_records: bool = True,
 ) -> dict[str, Any]:
     """Apply a knowledge-base overlay to a node-link graph in place.
 
@@ -339,7 +393,13 @@ def apply_overlay(
     of the records that stay out in ``conflict_edges``, ``dangling_edges`` and
     ``stale_patch_nodes`` (sorted).  ``overlay_changed`` is True when the
     overlay changed too (new ids, anchors or moves), so its owner saves it.
+
+    The overlay can be a mapping that reads its records on demand (see
+    ``kb_store.OverlayTable``): a record that changes in place is assigned
+    again.  With ``copy_records=False`` the graph takes the overlay records
+    without a deep copy; use it when each read returns a new copy.
     """
+    clone = copy.deepcopy if copy_records else _same
     key = links_key or ("links" if "links" in data or "edges" not in data else "edges")
     if directed is None:
         directed = bool(data.get("directed", False))
@@ -367,18 +427,23 @@ def apply_overlay(
         )
     moved_ids = {move["from"]: move["to"] for move in applied_moves}
 
+    gone_nodes, kb_nodes = _key_set(deleted_nodes), _key_set(ov_nodes)
     by_id: dict[str, dict[str, Any]] = {}
     removed: set[str] = set()
     kept_nodes: list[dict[str, Any]] = []
+    # The loops below inline ``is_kb_record`` and ``_pair_key``: they run once for each record.
     for node in nodes:
         nid = str(node.get("id"))
-        if nid in deleted_nodes or (is_kb_record(node) and nid not in ov_nodes):
+        if nid in gone_nodes or (node.get("_origin") == KB_ORIGIN and nid not in kb_nodes):
             removed.add(nid)
             continue
         kept_nodes.append(node)
         by_id[nid] = node
     for nid, rec in ov_nodes.items():
-        clean = {k: copy.deepcopy(v) for k, v in rec.items() if k not in DERIVED_NODE_KEYS}
+        if copy_records:
+            clean = {k: clone(v) for k, v in rec.items() if k not in DERIVED_NODE_KEYS}
+        else:
+            clean = {k: v for k, v in rec.items() if k not in DERIVED_NODE_KEYS}
         clean["id"] = nid
         node = by_id.get(nid)
         if node is None:
@@ -402,7 +467,7 @@ def apply_overlay(
         if not isinstance(patch, dict):
             continue
         if node is None:
-            if nid in deleted_nodes:
+            if nid in gone_nodes:
                 continue
             if lookup is None:
                 lookup = _anchor_lookup(kept_nodes)
@@ -422,6 +487,7 @@ def apply_overlay(
             anchor = _derive_anchor(node, patch)
             if anchor is not None:
                 patch[PATCH_ANCHOR] = anchor
+                patches[nid] = patch
                 anchored += 1
         changed = False
         for attr, value in patch.items():
@@ -432,12 +498,13 @@ def apply_overlay(
                     node.pop(attr)
                     changed = True
             elif node.get(attr, _MISSING) != value:
-                node[attr] = copy.deepcopy(value)
+                node[attr] = clone(value)
                 changed = True
         stats["nodes_patched"] += int(changed)
     stats["nodes_removed"] = len(removed)
     nodes[:] = kept_nodes
 
+    gone_edges, kb_edges = _key_set(deleted_edges), _key_set(ov_edges)
     by_eid: dict[str, dict[str, Any]] = {}
     by_pair: dict[tuple[str, str], dict[str, Any]] = {}
     kept_links: list[dict[str, Any]] = []
@@ -447,14 +514,14 @@ def apply_overlay(
         if (
             s in removed
             or t in removed
-            or eid in deleted_edges
-            or (is_kb_record(link) and eid not in ov_edges)
+            or eid in gone_edges
+            or (link.get("_origin") == KB_ORIGIN and eid not in kb_edges)
         ):
             stats["edges_removed"] += 1
             continue
         kept_links.append(link)
         by_eid.setdefault(eid, link)
-        by_pair.setdefault(_pair_key(s, t, directed), link)
+        by_pair.setdefault((s, t) if directed or s <= t else (t, s), link)
     rekeyed_edges: list[dict[str, str]] = []
     edges_anchored = 0
     edge_lookup: tuple[dict, dict, set[str]] | None = None
@@ -462,7 +529,8 @@ def apply_overlay(
         eid = str(eid)
         s, t = str(rec.get("source")), str(rec.get("target"))
         refresh: tuple[str, ...] = ()
-        if s not in by_id or t not in by_id:
+        source_node, target_node = by_id.get(s), by_id.get(t)
+        if source_node is None or target_node is None:
             if edge_lookup is None:
                 edge_lookup = _anchor_lookup(kept_nodes, patches)
             ends = _follow_edge(rec, by_id, edge_lookup, deleted_nodes)
@@ -481,22 +549,29 @@ def apply_overlay(
                 if old_end != new_end:
                     moved_ids.setdefault(old_end, new_end)
             eid, (s, t) = new_eid, ends
-        edges_anchored += int(_anchor_edge(rec, by_id, patches, refresh))
+            source_node, target_node = by_id[s], by_id[t]
+        # An edge between two KB nodes needs no anchor: ``_anchor_edge`` changes nothing.
+        if (
+            source_node.get("_origin") != KB_ORIGIN or target_node.get("_origin") != KB_ORIGIN
+        ) and _anchor_edge(rec, by_id, patches, refresh):
+            ov_edges[eid] = rec
+            edges_anchored += 1
         clean = {k: v for k, v in rec.items() if k != EDGE_ANCHOR}
         current = by_eid.get(eid)
         if current is not None:
             if current != clean:
                 current.clear()
-                current.update(copy.deepcopy(clean))
+                current.update(clone(clean))
                 stats["edges_updated"] += 1
             continue
-        if _pair_key(s, t, directed) in by_pair:
+        pair = (s, t) if directed or s <= t else (t, s)
+        if pair in by_pair:
             conflict_edges.append(eid)
             continue
-        new = copy.deepcopy(clean)
+        new = clone(clean)
         kept_links.append(new)
         by_eid[eid] = new
-        by_pair[_pair_key(s, t, directed)] = new
+        by_pair[pair] = new
         stats["edges_added"] += 1
     links[:] = kept_links
     stats["conflicts"] = len(conflict_edges)
@@ -878,6 +953,24 @@ OVERLAY_SKIP_KEYS = frozenset(
         "edges_anchored", "applied_moves", "moved_ids", "overlay_changed",
     }
 )
+# Keys of the ``apply_overlay`` result that name records that stay out.  A
+# later change can let them in, so a load with them applies the overlay again.
+_PENDING_KEYS = ("conflicts", "dangling", "stale_patches", "conflict_edges", "dangling_edges", "stale_patch_nodes")
+
+
+def _steady_stats() -> dict[str, Any]:
+    """Return the ``apply_overlay`` result for a graph that holds the whole overlay."""
+    counts = (
+        "nodes_added", "nodes_updated", "nodes_removed", "nodes_patched", "edges_added", "edges_updated",
+        "edges_removed", "conflicts", "dangling", "stale_patches", "patches_anchored", "edges_anchored",
+    )
+    lists = ("conflict_edges", "dangling_edges", "stale_patch_nodes", "rekeyed_patches", "rekeyed_edges", "applied_moves")
+    return {
+        **{k: 0 for k in counts},
+        **{k: [] for k in lists},
+        "moved_ids": {},
+        "overlay_changed": False,
+    }
 
 
 # Label keys (review 2, item 8):
@@ -947,12 +1040,17 @@ def _community_order(cid: Any) -> tuple[int, Any]:
 class KnowledgeBase:
     """A thread-safe, undoable editor for one graphify graph."""
 
+    _edge_index: dict[str, list[dict[str, Any]]] | None = None
+
     def __init__(self, graph_path: Path | str, *, autoflush: bool = True, create: bool = True) -> None:
         self.graph_path = Path(graph_path).resolve()
         self.out_dir = self.graph_path.parent
         self.kb_dir = self.out_dir / "kb"
         self.docs_dir = self.kb_dir / "documents"
         self.trash_dir = self.kb_dir / "trash"
+        self.store_path = self.kb_dir / STORE_FILE
+        # The files of a store from before ``store.sqlite``.  The store moves
+        # them in when it finds them: an import writes ``overlay.json`` too.
         self.overlay_path = self.kb_dir / "overlay.json"
         self.history_path = self.kb_dir / "history.jsonl"
         self.onto_path = ontology_path(self.graph_path)
@@ -972,18 +1070,24 @@ class KnowledgeBase:
         self._seen: dict[str, Any] = {}
         self._cache: dict[str, tuple[int, Any]] = {}
         self.version = 0
-        self.history: list[dict[str, Any]] = []
-        self._undone: set[int] = set()
-        self._max_seq = 0
-        self._hist_pos = 0
-        self._hist_ino: int | None = None
-        self._key_index: dict[str, list[int]] = {}
-        self._keys_of: dict[int, tuple[set[str], set[str]]] = {}
-        self._indexed = 0
+        self._store = Store(self.store_path)
+        # The overlay tables and the history read the store on demand.
+        self.overlay: dict[str, Any] = self._store.overlay()
+        self.history = HistoryView(self._store)
+        self.overlay_stats: dict[str, Any] = {}
+        # Graph records that a change removed, until ``_compact`` (by ``id``).
+        self._gone: dict[int, dict[str, Any]] = {}
+        # The overlay of ``kb/overlay.json``, until ``_load`` writes it to the store.
+        self._legacy_overlay: dict[str, Any] | None = None
         with self._lock, self._store_lock(create=self._create):
-            self._read_history(full=True)
+            self._import_legacy()
             self._load()
         self._maybe_flush()
+
+    def close(self) -> None:
+        """Close the store file.  The next call opens it again."""
+        with self._lock:
+            self._store.close()
 
     # -- store files and the cross-process lock -------------------------
     # Many processes can open one store: a ``kb serve`` server, ``kb ingest``
@@ -992,8 +1096,8 @@ class KnowledgeBase:
     def _signature(self) -> dict[str, Any]:
         return {
             "graph": _file_stat(self.graph_path),
-            "overlay": _file_stat(self.overlay_path),
-            "history": _file_stat(self.history_path),
+            "store": self._store.seq(),
+            "legacy": (_file_stat(self.overlay_path), _file_stat(self.history_path)),
             "ontology": _file_stat(self.onto_path),
             "generation": _file_stat(self.gen_path),
         }
@@ -1026,13 +1130,18 @@ class KnowledgeBase:
         if cur == seen:
             return False
         before = self.version
-        if cur["history"] != seen.get("history"):
-            self._read_history()
+        if any(cur["legacy"]) and self._import_legacy():
+            cur = self._signature()
         _gen, files = self._read_generation()
         # A flush of another KB process rewrites graph.json from the same
         # overlay: generation.json then names that file, and no reload is due.
         rebuilt = cur["graph"] != seen.get("graph") and cur["graph"] != files.get("graph")
-        if rebuilt or cur["overlay"] != seen.get("overlay") or cur["ontology"] != seen.get("ontology"):
+        if (
+            rebuilt
+            or cur["store"] != seen.get("store")
+            or cur["ontology"] != seen.get("ontology")
+            or self._legacy_overlay is not None
+        ):
             self._load()
         else:
             self._seen = cur
@@ -1045,7 +1154,7 @@ class KnowledgeBase:
     def _content_files(self) -> dict[str, Any]:
         return {
             "graph": _file_stat(self.graph_path),
-            "overlay": _file_stat(self.overlay_path),
+            "store": (self._store.seq(),),
             "ontology": _file_stat(self.onto_path),
         }
 
@@ -1080,7 +1189,43 @@ class KnowledgeBase:
             self._seen["generation"] = _file_stat(self.gen_path)
 
     def _last_seq(self) -> int:
-        return self._max_seq
+        return self._store.history_max()
+
+    def history_state(self) -> tuple[int, int]:
+        """Return the number of history entries and the newest seq, without the entries."""
+        with self._lock:
+            return self._store.history_count(), self._store.history_max()
+
+    def _import_legacy(self) -> bool:
+        """Move ``kb/history.jsonl`` and ``kb/overlay.json`` into the store.
+
+        A store from before ``store.sqlite`` has these files, and an import
+        (``export_store`` in another folder) writes ``kb/overlay.json``.  The
+        caller holds the store lock and then calls ``_load``: it applies the
+        overlay of the file and writes it to the store once.  The old files
+        stay as ``*.migrated``.  Return True when a file moved in.
+        """
+        moved = False
+        if self.history_path.is_file():
+            batch: list[dict[str, Any]] = []
+            with open(self.history_path, "rb") as fh:
+                for raw in fh:
+                    try:
+                        entry = _loads_json(raw)
+                    except ValueError:
+                        continue  # a line that a writer did not finish
+                    if isinstance(entry, dict) and "seq" in entry:
+                        batch.append(entry)
+                    if len(batch) >= 500:
+                        self._store.add_history(batch)
+                        batch = []
+            self._store.add_history(batch)
+            os.replace(self.history_path, self.history_path.with_name(self.history_path.name + ".migrated"))
+            moved = True
+        if self.overlay_path.is_file():
+            self._legacy_overlay = _read_legacy_overlay(self.overlay_path)
+            moved = True
+        return moved
 
     # -- loading -------------------------------------------------------
     def _load(self) -> None:
@@ -1093,8 +1238,8 @@ class KnowledgeBase:
             sig = self._signature()
             if self.graph_path.is_file():
                 try:
-                    data = json.loads(self.graph_path.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError) as exc:
+                    data = _loads_json(self.graph_path.read_bytes())
+                except (OSError, ValueError) as exc:
                     raise KBError(f"cannot read {self.graph_path}: {exc}") from exc
             elif self._create:
                 data = _empty_graph()
@@ -1105,18 +1250,34 @@ class KnowledgeBase:
             self.links_key = "links" if "links" in data or "edges" not in data else "edges"
             data.setdefault(self.links_key, [])
             self.data = data
-            self.overlay = self._read_overlay()
-            stats = apply_overlay(self.data, self.overlay, links_key=self.links_key)
-            self.overlay_stats = stats
-            self._reindex()
-            # The documents follow first: when a crash stops the overlay write,
-            # the next load moves the records and the documents again.
-            self._move_doc_links(stats["moved_ids"])
-            if stats["overlay_changed"] and self.overlay_path.is_file():
-                # Keep the new ids, anchors and applied moves, so the next load
-                # finds them at once.  The caller holds the store lock.
-                _dump_atomic(self.overlay_path, self.overlay)
-                sig["overlay"] = _file_stat(self.overlay_path)
+            self._gone = {}
+            self._store.discard()
+            legacy, self._legacy_overlay = self._legacy_overlay, None
+            ready = None if legacy is not None else self._materialized(sig)
+            if ready is not None:
+                # graph.json holds the whole overlay already (see ``flush``).
+                stats = ready
+                self.overlay_stats = stats
+                self._reindex()
+            else:
+                overlay = self.overlay if legacy is None else legacy
+                stats = apply_overlay(self.data, overlay, links_key=self.links_key, copy_records=False)
+                self.overlay_stats = stats
+                self._reindex()
+                # The documents follow first: when a crash stops the overlay write,
+                # the next load moves the records and the documents again.
+                self._move_doc_links(stats["moved_ids"])
+                if legacy is not None:
+                    # One write of the applied overlay, with its new ids, anchors and moves.
+                    sig["store"] = self._store.replace_overlay(legacy)
+                    os.replace(self.overlay_path, self.overlay_path.with_name(self.overlay_path.name + ".migrated"))
+                    sig["legacy"] = (_file_stat(self.overlay_path), _file_stat(self.history_path))
+                    del overlay, legacy
+                elif stats["overlay_changed"] and self._store.pending():
+                    # Keep the new ids, anchors and applied moves, so the next load
+                    # finds them at once.  The caller holds the store lock.
+                    sig["store"] = self._store.commit()
+                self._store.discard()
             changed = any(v for k, v in stats.items() if k not in OVERLAY_SKIP_KEYS)
             self.ontology_inferred = False
             onto = load_ontology(self.onto_path)
@@ -1130,6 +1291,34 @@ class KnowledgeBase:
             self._cache.clear()
             if changed or not self.graph_path.is_file():
                 self._dirty = True
+            elif ready is None:
+                self._mark_materialized()
+
+    def _materialized(self, sig: dict[str, Any]) -> dict[str, Any] | None:
+        """Return the overlay stats when ``graph.json`` holds the whole overlay, else None.
+
+        ``flush`` records the stats of ``graph.json`` and the store commit
+        counter that it wrote.  A load of the same files then skips
+        ``apply_overlay``.  Records that stay out (conflicts, dangling edges,
+        stale patches) can apply after a change, so they need the full load.
+        """
+        mark = self._store.meta("materialized")
+        if not isinstance(mark, dict) or sig["graph"] is None:
+            return None
+        if mark.get("graph") != list(sig["graph"]) or mark.get("seq") != sig["store"]:
+            return None
+        stats = mark.get("stats")
+        if not isinstance(stats, dict) or any(stats.get(k) for k in _PENDING_KEYS):
+            return None
+        return {**_steady_stats(), **stats}
+
+    def _mark_materialized(self) -> None:
+        """Record that ``graph.json`` holds the whole overlay (see ``_materialized``)."""
+        stat = _file_stat(self.graph_path)
+        if stat is None or not (self._store.exists() or self.kb_dir.is_dir()):
+            return
+        stats = {k: v for k, v in self.overlay_stats.items() if k in _PENDING_KEYS}
+        self._store.set_meta(materialized={"graph": list(stat), "seq": self._store.seq(), "stats": stats})
 
     def _maybe_flush(self) -> None:
         if self._dirty and self.autoflush:
@@ -1149,6 +1338,7 @@ class KnowledgeBase:
         The default ontology and the Infer action use this one base, so the
         two never disagree about the KB records.
         """
+        self._compact()
         base = {
             "nodes": [n for n in self.data["nodes"] if n.get("_origin") != KB_ORIGIN],
             "links": [x for x in self.data[self.links_key] if x.get("_origin") != KB_ORIGIN],
@@ -1156,23 +1346,49 @@ class KnowledgeBase:
         return with_kb_vocabulary(infer_ontology(base, class_key=class_key))
 
     def _reindex(self) -> None:
-        self._nodes: dict[str, dict[str, Any]] = {}
-        for node in self.data["nodes"]:
-            self._nodes[str(node.get("id"))] = node
-        self._edges: dict[str, list[dict[str, Any]]] = {}
-        self._out: dict[str, list[dict[str, Any]]] = {}
-        self._in: dict[str, list[dict[str, Any]]] = {}
+        self._nodes: dict[str, dict[str, Any]] = {str(node.get("id")): node for node in self.data["nodes"]}
+        self._edge_index = None
+        outs: dict[str, list[dict[str, Any]]] = {}
+        ins: dict[str, list[dict[str, Any]]] = {}
         for link in self.data[self.links_key]:
-            self._index_edge(link)
+            s, t = str(link.get("source")), str(link.get("target"))
+            found = outs.get(s)
+            if found is None:
+                outs[s] = [link]
+            else:
+                found.append(link)
+            found = ins.get(t)
+            if found is None:
+                ins[t] = [link]
+            else:
+                found.append(link)
+        self._out, self._in = outs, ins
+
+    @property
+    def _edges(self) -> dict[str, list[dict[str, Any]]]:
+        """Return the links by edge id.  The first use builds the index: each id is a hash."""
+        index = self._edge_index
+        if index is None:
+            index = {}
+            gone = self._gone
+            for link in self.data[self.links_key]:
+                if gone and id(link) in gone:
+                    continue
+                eid = edge_id(str(link.get("source")), str(link.get("target")), link.get("relation"))
+                found = index.get(eid)
+                if found is None:
+                    index[eid] = [link]
+                else:
+                    found.append(link)
+            self._edge_index = index
+        return index
 
     def _index_edge(self, link: dict[str, Any]) -> None:
         s, t = str(link.get("source")), str(link.get("target"))
-        self._edges.setdefault(edge_id(s, t, link.get("relation")), []).append(link)
+        if self._edge_index is not None:
+            self._edge_index.setdefault(edge_id(s, t, link.get("relation")), []).append(link)
         self._out.setdefault(s, []).append(link)
         self._in.setdefault(t, []).append(link)
-
-    def _read_overlay(self) -> dict[str, Any]:
-        return read_overlay(self.out_dir) or _empty_overlay()
 
     def refresh_if_changed(self) -> bool:
         """Load the changes of other processes: a graphify rebuild or another writer."""
@@ -1207,48 +1423,75 @@ class KnowledgeBase:
         of that time.  The next graphify build clusters the whole graph again.
         Return True when a community changed.
         """
-        todo = [n for n in self.data["nodes"] if is_kb_record(n) and (n.get("community") is None or n.get("_kb_community"))]
-        nodes = list(todo)
-        before = [(n.get("community"), n.get("community_name")) for n in nodes]
+        todo: list[dict[str, Any]] = []
+        seeds: list[dict[str, Any]] = []
+        for n in self.data["nodes"]:
+            cid = n.get("community")
+            if is_kb_record(n) and (cid is None or n.get("_kb_community")):
+                todo.append(n)
+            elif cid is not None and not isinstance(cid, bool):
+                seeds.append(n)
+        before = [(n.get("community"), n.get("community_name")) for n in todo]
         for node in todo:
             if node.pop("_kb_community", None):
                 node.pop("community", None)
                 node.pop("community_name", None)
-        while todo:
+        by_id, outs, ins = self._nodes, self._out, self._in
+        waiting = {id(n): n for n in todo}
+
+        def neighbours(node: dict[str, Any]) -> Iterator[dict[str, Any]]:
+            nid = str(node.get("id"))
+            for links, end in ((outs.get(nid), "target"), (ins.get(nid), "source")):
+                for link in links or ():
+                    other = by_id.get(str(link.get(end)))
+                    if other is not None:
+                        yield other
+
+        def near(sources: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+            found: dict[int, dict[str, Any]] = {}
+            for source in sources:
+                for other in neighbours(source):
+                    if id(other) in waiting:
+                        found[id(other)] = other
+            return list(found.values())
+
+        # Only a node next to a label can get a vote, so the first round reads
+        # the smaller side and each later round reads the neighbours of the
+        # new labels.  Each round votes with the labels of the round before.
+        candidates = near(seeds) if len(seeds) < len(todo) else todo
+        while candidates:
             picks: list[tuple[dict[str, Any], Any, Any]] = []
-            for node in todo:
-                nid = str(node.get("id"))
-                votes: Counter[Any] = Counter()
+            for node in candidates:
+                votes: Counter[Any] | None = None
                 names: dict[Any, Any] = {}
-                for link in self._out.get(nid, []) + self._in.get(nid, []):
-                    s = str(link.get("source"))
-                    other = self._nodes.get(str(link.get("target")) if s == nid else s)
-                    if other is None:
-                        continue
+                for other in neighbours(node):
                     cid = other.get("community")
                     if cid is None or isinstance(cid, bool):
                         continue
+                    if votes is None:
+                        votes = Counter()
                     votes[cid] += 1
                     if other.get("community_name"):
                         names.setdefault(cid, other["community_name"])
                 if votes:
-                    best = min(votes, key=lambda c: (-votes[c], _community_order(c)))
+                    tally = votes
+                    best = min(tally, key=lambda c: (-tally[c], _community_order(c)))
                     picks.append((node, best, names.get(best)))
-            if not picks:
-                break
             for node, best, name in picks:
                 node["community"] = best
                 node["_kb_community"] = True
                 if name:
                     node["community_name"] = name
-            todo = [n for n in todo if n.get("community") is None]
-        return before != [(n.get("community"), n.get("community_name")) for n in nodes]
+                waiting.pop(id(node), None)
+            candidates = near(node for node, _best, _name in picks)
+        return before != [(n.get("community"), n.get("community_name")) for n in todo]
 
     # -- raw graph mutation (no overlay, no history) --------------------
     def _raw_put_node(self, rec: dict[str, Any]) -> None:
         nid = str(rec["id"])
         node = self._nodes.get(nid)
         if node is None:
+            self._gone.pop(id(rec), None)
             self.data["nodes"].append(rec)
             self._nodes[nid] = rec
         else:
@@ -1258,9 +1501,26 @@ class KnowledgeBase:
     def _raw_drop_node(self, nid: str) -> None:
         node = self._nodes.pop(nid, None)
         if node is not None:
-            self.data["nodes"] = [n for n in self.data["nodes"] if n is not node]
+            # The list keeps the node until ``_compact``: one pass for each
+            # change, not one pass for each removed record.
+            self._gone[id(node)] = node
         self._out.pop(nid, None)
         self._in.pop(nid, None)
+
+    def _compact(self) -> None:
+        """Remove the records that ``_raw_drop_*`` dropped from the graph lists.
+
+        A change calls this before it reads the lists and when it ends.
+        ``_gone`` keeps each record alive, so its ``id`` stays unique.
+        """
+        gone = self._gone
+        if not gone:
+            return
+        for key in ("nodes", self.links_key):
+            items = self.data.get(key)
+            if isinstance(items, list):
+                items[:] = [x for x in items if id(x) not in gone]
+        self._gone = {}
 
     def _raw_put_edge(self, rec: dict[str, Any]) -> None:
         eid = edge_id(rec.get("source"), rec.get("target"), rec.get("relation"))
@@ -1269,14 +1529,14 @@ class KnowledgeBase:
             existing[0].clear()
             existing[0].update(rec)
             return
+        self._gone.pop(id(rec), None)
         self.data[self.links_key].append(rec)
         self._index_edge(rec)
 
     def _raw_drop_edge_record(self, link: dict[str, Any]) -> None:
         s, t = str(link.get("source")), str(link.get("target"))
         eid = edge_id(s, t, link.get("relation"))
-        key = self.links_key
-        self.data[key] = [x for x in self.data[key] if x is not link]
+        self._gone[id(link)] = link
         for index, k in ((self._edges, eid), (self._out, s), (self._in, t)):
             bucket = index.get(k)
             if bucket is not None:
@@ -1385,7 +1645,8 @@ class KnowledgeBase:
         moves = self.overlay["moved_nodes"]
         if not any(old not in self._nodes and _move_target(old, moves, self._nodes) for old in moves):
             return
-        self.overlay_stats = apply_overlay(self.data, self.overlay, links_key=self.links_key)
+        self._compact()
+        self.overlay_stats = apply_overlay(self.data, self.overlay, links_key=self.links_key, copy_records=False)
         self._reindex()
         self._move_doc_links(self.overlay_stats["moved_ids"])
 
@@ -1518,7 +1779,6 @@ class KnowledgeBase:
             with self._store_lock():
                 self._sync()
                 log: list[tuple] = []
-                overlay_before = copy.deepcopy(self.overlay)
                 self._tx_keys = (set(), set())
                 self._undo_log = log
                 try:
@@ -1530,13 +1790,18 @@ class KnowledgeBase:
                             self._run_inverse(step)
                         except Exception:
                             pass
-                    self.overlay = overlay_before
+                    # The store file still holds the overlay from before the change.
+                    self._store.discard()
+                    self._compact()
                     self._cache.clear()
                     raise
                 finally:
                     self._undo_log = None
                 if log or always:
                     self._commit(op, summary, actor, log, extra)
+                else:
+                    self._store.discard()
+                    self._compact()
 
     def _commit(
         self,
@@ -1546,22 +1811,34 @@ class KnowledgeBase:
         log: list[tuple],
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Apply due node moves, write the overlay and one history entry.
+        """Apply due node moves, then write the overlay rows and one history entry.
 
+        One SQLite transaction writes only the records that the change touched.
         The caller holds the store lock.
         """
+        self._compact()
         self._settle_moves()
-        _dump_atomic(self.overlay_path, self.overlay)
         seq = self._last_seq() + 1
         entry = {"seq": seq, "ts": now_iso(), "actor": actor or "api", "op": op, "summary": summary, "undo": log}
         entry.update(extra or {})
         writes, reads = self._tx_keys
         entry["keys"] = {"w": sorted(writes), "r": sorted(reads - writes)}
-        self._append_history(entry)
-        self._add_history_entry(entry)
+        try:
+            self._seen["store"] = self._store.commit(entry)
+        except BaseException:
+            # The change is not in the file: take it back in memory too.
+            self._store.discard()
+            for step in reversed(log):
+                try:
+                    self._run_inverse(step)
+                except Exception:
+                    pass
+            self._store.discard()
+            self._compact()
+            self._cache.clear()
+            raise
         self._thread.seqs = [*getattr(self._thread, "seqs", []), seq]
-        for name, path in (("overlay", self.overlay_path), ("ontology", self.onto_path)):
-            self._seen[name] = _file_stat(path)
+        self._seen["ontology"] = _file_stat(self.onto_path)
         self._set_generation(bump=True)
         self._cache.clear()
         self._dirty = True
@@ -1596,6 +1873,7 @@ class KnowledgeBase:
                 _dump_atomic(self.graph_path, self.data, compact=True)
                 self._seen["graph"] = _file_stat(self.graph_path)
                 self._set_generation(bump=moved)
+                self._mark_materialized()
                 if moved:
                     self._cache.clear()
                 self._dirty = False
@@ -1652,106 +1930,33 @@ class KnowledgeBase:
             keys = self._footprint([tuple(s) for s in entry.get("undo", [])])
         return set(keys.get("w") or ()), set(keys.get("r") or ())
 
-    def _index_keys(self) -> None:
-        """Index the footprints of the new history entries by record key (item 13).
+    def _undo_conflicts(self, target: dict[str, Any], undone: set[int]) -> tuple[list[int], list[str]]:
+        """Return the later live changes that depend on ``target`` and the shared records.
 
-        Undo then reads only the entries that share a key with its target, not
-        the whole history.
+        The store keeps the footprint of each entry in its own column, so this
+        reads only the footprints of the later entries, not their undo steps.
         """
-        for entry in self.history[self._indexed:]:
-            try:
-                seq = int(entry["seq"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            if entry.get("op") == "undo":
-                continue
-            w, r = self._entry_keys(entry)
-            self._keys_of[seq] = (w, r)
-            for key in w | r:
-                self._key_index.setdefault(key, []).append(seq)
-        self._indexed = len(self.history)
-
-    def _undo_conflicts(self, target: dict[str, Any]) -> tuple[list[int], list[str]]:
-        """Return the later live changes that depend on ``target`` and the shared records."""
-        self._index_keys()
         first = int(target["seq"])
-        writes, _reads = self._keys_of.get(first) or self._entry_keys(target)
+        writes, _reads = self._entry_keys(target)
         found: set[int] = set()
         shared: set[str] = set()
-        for key in writes:
-            for seq in self._key_index.get(key, ()):
-                if seq > first and seq not in self._undone:
-                    found.add(seq)
-                    shared.add(key)
-        return sorted(found), sorted(shared)
-
-    # -- history file ----------------------------------------------------
-    # ``kb/history.jsonl`` only grows: an undo is a new entry.  Each process
-    # reads the lines that other processes added since its last read.
-    def _reset_history(self) -> None:
-        self.history = []
-        self._undone = set()
-        self._max_seq = 0
-        self._hist_pos = 0
-        self._hist_ino = None
-        self._key_index: dict[str, list[int]] = {}
-        self._keys_of: dict[int, tuple[set[str], set[str]]] = {}
-        self._indexed = 0
-
-    def _add_history_entry(self, entry: dict[str, Any]) -> None:
-        entry["undo"] = [tuple(step) for step in entry.get("undo", [])]
-        self.history.append(entry)
-        try:
-            self._max_seq = max(self._max_seq, int(entry["seq"]))
-            if entry.get("op") == "undo" and entry.get("target"):
-                self._undone.add(int(entry["target"]))
-        except (KeyError, TypeError, ValueError):
-            pass
-
-    def _read_history(self, *, full: bool = False) -> None:
-        """Read the history entries that are new since the last read."""
-        stat = _file_stat(self.history_path)
-        if full or stat is None or stat[0] != self._hist_ino or stat[1] < self._hist_pos:
-            self._reset_history()
-        self._seen["history"] = stat
-        if stat is None:
-            return
-        with open(self.history_path, "rb") as fh:
-            fh.seek(self._hist_pos)
-            chunk = fh.read()
-        end = chunk.rfind(b"\n")
-        self._hist_ino = stat[0]
-        if end < 0:
-            return
-        for raw in chunk[: end + 1].splitlines():
-            try:
-                entry = json.loads(raw)
-            except (UnicodeDecodeError, json.JSONDecodeError):
+        if not writes:
+            return [], []
+        for seq, keys, blob in self._store.later_keys(first):
+            if seq in undone:
                 continue
-            if isinstance(entry, dict) and "seq" in entry:
-                self._add_history_entry(entry)
-        self._hist_pos += end + 1
-
-    def _append_history(self, entry: dict[str, Any]) -> None:
-        """Append one entry.  The caller holds the store lock."""
-        self.history_path.parent.mkdir(parents=True, exist_ok=True)
-        line = (json.dumps(entry, ensure_ascii=False, default=str) + "\n").encode("utf-8")
-        with open(self.history_path, "ab") as fh:
-            if fh.tell() > 0:
-                # A writer that died during an append leaves a line without
-                # its end.  Close it, so that this entry is its own line.
-                with open(self.history_path, "rb") as check:
-                    check.seek(-1, os.SEEK_END)
-                    if check.read(1) != b"\n":
-                        line = b"\n" + line
-            fh.write(line)
-            fh.flush()
-            os.fsync(fh.fileno())
-            size = fh.tell()
-        stat = _file_stat(self.history_path)
-        self._hist_pos = size
-        self._hist_ino = stat[0] if stat else None
-        self._seen["history"] = stat
+            if isinstance(keys, dict):
+                touched = set(keys.get("w") or ()) | set(keys.get("r") or ())
+            elif blob is not None:
+                w, r = self._entry_keys(entry_from_blob(blob))
+                touched = w | r
+            else:
+                continue
+            hit = writes & touched
+            if hit:
+                found.add(seq)
+                shared |= hit
+        return sorted(found), sorted(shared)
 
     # -- events ----------------------------------------------------------
     def subscribe(self, listener: Callable[[dict[str, Any]], None]) -> Callable[[], None]:
@@ -1814,20 +2019,42 @@ class KnowledgeBase:
 
     def stats(self) -> dict[str, Any]:
         with self._lock:
+            return dict(self._cached("stats", self._build_stats))
+
+    def counts(self) -> dict[str, int]:
+        """Return the node, edge and document counts, without the class and relation counts."""
+        with self._lock:
+            return {"nodes": len(self._nodes), "edges": len(self.data[self.links_key]), "documents": self._document_count()}
+
+    def _document_count(self) -> int:
+        """Count the document folders with a ``meta.json``, without a read of the files."""
+        try:
+            entries = os.scandir(self.docs_dir)
+        except OSError:
+            return 0
+        with entries:
+            return sum(
+                1 for e in entries if not e.name.startswith(".") and os.path.isfile(os.path.join(e.path, "meta.json"))
+            )
+
+    def _build_stats(self) -> dict[str, Any]:
+        with self._lock:
+            # ``node_class`` without its method lookup and cache read for each node.
+            targets, owners = self._cached("method_sets", self._method_sets)
+            node_class = self.ontology.node_class
             classes: dict[str, int] = {}
             for node in self.data["nodes"]:
-                c = self.node_class(node)
+                c = node_class(node, method_targets=targets, method_owners=owners) or "unclassified"
                 classes[c] = classes.get(c, 0) + 1
             relations: dict[str, int] = {}
-            for link in self.data[self.links_key]:
-                r = str(link.get("relation"))
-                relations[r] = relations.get(r, 0) + 1
+            for relation, count in Counter(map(methodcaller("get", "relation"), self.data[self.links_key])).items():
+                relations[str(relation)] = relations.get(str(relation), 0) + count
             return {
                 "version": self.version,
                 "graph": str(self.graph_path),
                 "nodes": len(self._nodes),
                 "edges": len(self.data[self.links_key]),
-                "documents": len(self.list_documents()),
+                "documents": self._document_count(),
                 "kb_nodes": len(self.overlay["nodes"]),
                 "kb_edges": len(self.overlay["edges"]),
                 "classes": dict(sorted(classes.items(), key=lambda kv: -kv[1])),
@@ -1846,11 +2073,16 @@ class KnowledgeBase:
         ``json``, a text file as ``text`` and an asset as ``base64``.  The
         history, the trash and the lock stay out: a copy starts its own history.
         """
+        return _loads_json(self.export_json(assets=assets))
+
+    def export_json(self, *, assets: bool = False) -> bytes:
+        """Return ``export_store`` as JSON bytes.
+
+        The graph goes into the answer as JSON text, without a copy of its records.
+        """
         with self._lock:
-            files: list[dict[str, Any]] = [
-                {"path": "graph.json", "json": json.loads(json.dumps(self.data, default=str))},
-                {"path": "kb/overlay.json", "json": json.loads(json.dumps(self.overlay, default=str))},
-            ]
+            overlay = {"version": 1, **{k: dict(v.items()) for k, v in self.overlay.items() if k != "version"}}
+            files: list[dict[str, Any]] = [{"path": "kb/overlay.json", "json": overlay}]
             if not self.ontology_inferred and self.onto_path.is_file():
                 files.append({"path": "ontology.json", "text": self.onto_path.read_text(encoding="utf-8")})
             folders = sorted(self.docs_dir.iterdir()) if self.docs_dir.is_dir() else []
@@ -1866,7 +2098,12 @@ class KnowledgeBase:
                         if item.is_file() and not item.name.startswith("."):
                             data = base64.b64encode(item.read_bytes()).decode("ascii")
                             files.append({"path": f"{base}/assets/{item.name}", "base64": data})
-            return {"format": "graphify-kb-export", "version": self.version, "exported_at": now_iso(), "files": files}
+            head = _dumps_json({"format": "graphify-kb-export", "version": self.version, "exported_at": now_iso()})
+            parts = [head[:-1], b',"files":[{"path":"graph.json","json":', _dumps_json(self.data), b"}"]
+        for item in files:
+            parts += [b",", _dumps_json(item)]
+        parts.append(b"]}")
+        return b"".join(parts)
 
     def graph_view(self) -> dict[str, Any]:
         """Return a compact graph for the viewer.
@@ -1981,6 +2218,7 @@ class KnowledgeBase:
         with self._lock:
             if self._undo_log is not None:
                 # Inside a change the cached index can miss new nodes.
+                self._compact()
                 hits = [str(n.get("id")) for n in self.data["nodes"] if label_key(n.get("label")) == key]
             else:
                 rest, order = self._cached("label_rest", self._label_rest)
@@ -1997,6 +2235,7 @@ class KnowledgeBase:
         index = self._link_index()
         rest: dict[str, list[str]] = {}
         order: dict[str, int] = {}
+        self._compact()
         for pos, node in enumerate(self.data["nodes"]):
             nid = str(node.get("id"))
             order.setdefault(nid, pos)
@@ -2013,26 +2252,35 @@ class KnowledgeBase:
         hits: list[tuple[float, dict[str, Any]]] = []
         by_id: dict[str, tuple[float, dict[str, Any]]] = {}
         with self._lock:
-            for node in self.data["nodes"]:
+            index = self._cached("search_text", self._search_text)
+            nodes, (labels, starts) = index["nodes"], index["label"]
+            in_label = _scan(labels, starts, q)
+            every: set[int] = set()
+            if len(terms) > 1:
+                every = set(_scan(labels, starts, terms[0]))
+                for term in terms[1:]:
+                    every &= _scan(labels, starts, term).keys()
+            (ids, id_starts), (srcs, src_starts) = index["id"], index["src"]
+            in_id, in_src = _scan(ids, id_starts, q), _scan(srcs, src_starts, q)
+            for i in sorted(in_label.keys() | every | in_id.keys() | in_src.keys()):
+                node = nodes[i]
                 node_cls = self.node_class(node)
                 # A class filter also takes the subclasses (RDFS rule rdfs9): code finds code.function.
                 if cls and not self.ontology.is_a(node_cls, cls):
                     continue
-                label = str(node.get("label") or "").lower()
-                nid = str(node.get("id")).lower()
-                src = str(node.get("source_file") or "").lower()
                 score = 0.0
-                if label == q:
+                at = in_label.get(i)
+                if at == 0 and starts[i + 1] - starts[i] - 1 == len(q):
                     score += 100
-                elif label.startswith(q):
+                elif at == 0:
                     score += 60
-                elif q in label:
+                elif at is not None:
                     score += 35
-                elif all(t in label for t in terms):
+                elif i in every:
                     score += 25
-                if q in nid:
+                if i in in_id:
                     score += 8
-                if q in src:
+                if i in in_src:
                     score += 4
                 if score:
                     score += min(len(self._out.get(str(node.get("id")), ())), 40) / 40
@@ -2045,10 +2293,7 @@ class KnowledgeBase:
                         "score": round(score, 2),
                     })
             if not cls or cls == "document":
-                for meta in self.list_documents():
-                    title = str(meta.get("title") or "").lower()
-                    body = self._read_body(meta["id"])
-                    low = body.lower()
+                for meta, title, body, low in self._cached("search_documents", self._search_documents):
                     score = 0.0
                     if q in title:
                         score += 50
@@ -2075,6 +2320,24 @@ class KnowledgeBase:
         hits.extend(by_id.values())
         hits.sort(key=lambda h: -h[0])
         return [h[1] for h in hits[: max(1, int(limit))]]
+
+    def _search_text(self) -> dict[str, Any]:
+        """Return the lowercase labels, ids and source files of the nodes, built once for each version."""
+        nodes = list(self.data["nodes"])
+        return {
+            "nodes": nodes,
+            "label": _joined([str(n.get("label") or "").lower() for n in nodes]),
+            "id": _joined([str(n.get("id")).lower() for n in nodes]),
+            "src": _joined([str(n.get("source_file") or "").lower() for n in nodes]),
+        }
+
+    def _search_documents(self) -> list[tuple[dict[str, Any], str, str, str]]:
+        """Return each document with its lowercase title, its body and its lowercase body, read once for each version."""
+        out = []
+        for meta in self.list_documents():
+            body = self._read_body(meta["id"])
+            out.append((meta, str(meta.get("title") or "").lower(), body, body.lower()))
+        return out
 
     # -- node and edge writes -------------------------------------------
     def _new_node_id(self, label: str) -> str:
@@ -2514,9 +2777,10 @@ class KnowledgeBase:
         nodes again.  Delete one with ``delete_edge`` or ``delete_node``.
         """
         out: list[dict[str, Any]] = []
-        for eid, rec in sorted(self.overlay["edges"].items()):
-            if eid in self._edges:
-                continue
+        edges = self.overlay["edges"]
+        # The ids come without their records: only the edges outside the graph are read.
+        for eid in sorted(e for e in edges if e not in self._edges):
+            rec = edges[eid]
             s, t = str(rec.get("source")), str(rec.get("target"))
             edge = {"id": eid, "source": s, "target": t, "relation": rec.get("relation")}
             missing = [end for end in (s, t) if end not in self._nodes]
@@ -2575,17 +2839,18 @@ class KnowledgeBase:
     # -- history ---------------------------------------------------------
     def history_view(self, *, limit: int = 100) -> list[dict[str, Any]]:
         with self._lock:
+            undone = self._store.undone()
             rows = []
-            for entry in reversed(self.history[-max(1, int(limit)):]):
+            for row in self._store.history_rows(max(1, int(limit))):
                 rows.append({
-                    "seq": entry["seq"],
-                    "ts": entry.get("ts"),
-                    "actor": entry.get("actor"),
-                    "op": entry.get("op"),
-                    "summary": entry.get("summary"),
-                    "steps": len(entry.get("undo", [])),
-                    "undone": entry["seq"] in self._undone,
-                    "target": entry.get("target"),
+                    "seq": row["seq"],
+                    "ts": row["ts"],
+                    "actor": row["actor"],
+                    "op": row["op"],
+                    "summary": row["summary"],
+                    "steps": row["steps"] or 0,
+                    "undone": row["seq"] in undone,
+                    "target": row["target"],
                 })
             return rows
 
@@ -2604,15 +2869,10 @@ class KnowledgeBase:
                 raise KBError(f"seq must be an integer, not {seq!r}") from None
         with self._lock, self._store_lock():
             self._sync()
-            target = None
-            for entry in reversed(self.history):
-                if entry.get("op") == "undo" or entry["seq"] in self._undone:
-                    continue
-                if seq is None or entry["seq"] == seq:
-                    target = entry
-                    break
+            undone = self._store.undone()
+            target = self._store.undo_target(seq, undone)
             if target is None:
-                if seq is not None and any(e["seq"] == seq for e in self.history):
+                if seq is not None and self._store.has_seq(seq):
                     raise Conflict(f"change {seq} is an undo or is undone already")
                 raise NotFound("there is no change to undo" if seq is None else f"change {seq} does not exist")
             gone = [
@@ -2627,7 +2887,7 @@ class KnowledgeBase:
                 raise Conflict(
                     f"change {target['seq']} cannot be undone: the graph has no node {', '.join(sorted(gone)[:5])} now"
                 )
-            later, shared = self._undo_conflicts(target)
+            later, shared = self._undo_conflicts(target, undone)
             if later:
                 shown = ", ".join(_describe_key(k) for k in shared[:5])
                 more = f" and {len(shared) - 5} more" if len(shared) > 5 else ""
@@ -2637,20 +2897,16 @@ class KnowledgeBase:
                     f"or need {shown}{more}. Undo the later changes first.",
                     later,
                 )
-            self._undone.add(target["seq"])
-            try:
-                with self._tx(
-                    "undo",
-                    f"Undo {target.get('summary')}",
-                    actor,
-                    extra={"target": target["seq"]},
-                    always=True,
-                ):
-                    for step in reversed(target.get("undo", [])):
-                        self._run_inverse(tuple(step))
-            except BaseException:
-                self._undone.discard(target["seq"])
-                raise
+            # The undo entry names its target: the store reads the undone set from it.
+            with self._tx(
+                "undo",
+                f"Undo {target.get('summary')}",
+                actor,
+                extra={"target": target["seq"]},
+                always=True,
+            ):
+                for step in reversed(target.get("undo", [])):
+                    self._run_inverse(tuple(step))
             return {"undone": target["seq"], "summary": target.get("summary"), "version": self.version}
 
     # -- documents -------------------------------------------------------
@@ -2743,6 +2999,7 @@ class KnowledgeBase:
 
     def _link_index(self) -> LinkIndex:
         """Return the entity-linking index of the graph, rebuilt once per version."""
+        self._compact()
         return self._cached("link_index", lambda: LinkIndex.build(self.data["nodes"], self.data[self.links_key]))
 
     def _resolve_wiki_links(self, body: str, actor: str | None) -> tuple[list[str], list[dict[str, Any]]]:

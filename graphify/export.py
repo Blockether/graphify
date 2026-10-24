@@ -125,6 +125,8 @@ def _strip_diacritics(text: str | None) -> str:
     import unicodedata
     if not isinstance(text, str):
         text = "" if text is None else str(text)
+    if text.isascii():
+        return text  # NFKD keeps ASCII text and it has no combining marks
     nfkd = unicodedata.normalize("NFKD", text)
     return "".join(c for c in nfkd if not unicodedata.combining(c))
 

@@ -59,11 +59,12 @@ The interface works with touch on a tablet and a phone.
 |---|---|
 | `graphify-out/graph.json` | The graph. KB nodes and edges are part of it, next to the code nodes. |
 | `graphify-out/ontology.json` | The ontology. Without this file, graphify infers one from the graph. |
-| `graphify-out/kb/overlay.json` | Your edits, and the node moves that wait for a rebuild. `graphify update`, `graphify extract` and `graphify watch` apply them again after each rebuild. |
-| `graphify-out/kb/history.jsonl` | One line for each change, with the data to undo it. |
+| `graphify-out/kb/store.sqlite` | Your edits, the node moves that wait for a rebuild, and the change history with the data to undo each change. `graphify update`, `graphify extract` and `graphify watch` apply the edits again after each rebuild. |
 | `graphify-out/kb/generation.json` | The version number of the knowledge base. It only grows, also across restarts. |
 | `graphify-out/kb/documents/<id>/` | `meta.json`, `body.md` and `assets/` of one document. |
 | `graphify-out/kb/trash/` | Deleted documents and files, so that an undo can restore them. |
+
+`kb/store.sqlite` is one SQLite file. A change writes only the records that it touches, so a change stays fast in a large store. From 1,000 records, the store compresses each record with zstd and a dictionary that it makes from its own records. A store from an older graphify version keeps its edits in `kb/overlay.json` and its history in `kb/history.jsonl`. The first load moves them into `kb/store.sqlite` and renames the old files to `*.migrated`.
 
 Nodes that you add get ids that start with `kb:`. Document nodes start with `doc:`. A new KB node joins the community that most of its neighbours belong to.
 
@@ -326,7 +327,7 @@ The confidence rubric is the same as graphify's:
 
 ## Change history and undo
 
-Every change is one line in `kb/history.jsonl`, with its author and the steps to undo it.
+Every change is one entry in the history of `kb/store.sqlite`, with its author and the steps to undo it.
 
 - Undo the latest change at any time.
 - Undo an older change only when no later change touched the same records. Otherwise the undo fails with `409`, and the message names the later changes. Undo those first.
@@ -459,6 +460,7 @@ On the 47,817-node Vis graph, the overview is 126 KB with gzip, and the largest 
 - `ontology.json` is in the list only when the store has one. Without it, the copy infers the same ontology.
 - `assets=1` adds the files of the documents in base64, such as `{"path": "kb/documents/notes/assets/plan.png", "base64": "..."}`. Without it, the answer is smaller, but the copy has no images or attachments.
 - The history, the trash and the lock stay out. A copy starts with an empty history.
+- The first load of the copy moves `kb/overlay.json` into `kb/store.sqlite`.
 
 ### Caching
 
