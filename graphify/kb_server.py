@@ -1047,6 +1047,8 @@ class KBHandler(BaseHTTPRequestHandler):
             target = write_static_html(kb, target)
             self._json(200, {"path": str(target), "bytes": target.stat().st_size})
         elif head == "export" and method == "GET":
+            # A flushed graph lets the copy open without applying the overlay again.
+            kb.flush()
             self._send(200, kb.export_json(assets=q.get("assets") == "1"), "application/json; charset=utf-8")
         elif head == "flush" and method == "POST":
             self._json(200, {"written": kb.flush()})
@@ -1341,9 +1343,13 @@ def serve(
     read_only: bool = False,
     allowed_hosts: list[str] | None = None,
     open_browser: bool = False,
+    store: str | None = None,
 ) -> None:
-    """Run the knowledge base server until Ctrl+C, SIGTERM or SIGHUP."""
-    kb = KnowledgeBase(graph_path, autoflush=False)
+    """Run the knowledge base server until Ctrl+C, SIGTERM or SIGHUP.
+
+    ``store`` names the store backend (see ``KnowledgeBase``).
+    """
+    kb = KnowledgeBase(graph_path, autoflush=False, store=store)
     server = KBServer(kb, host, port, token=token, read_only=read_only, allowed_hosts=allowed_hosts)
     restore = _stop_on_signals(server)
     counts = kb.counts()

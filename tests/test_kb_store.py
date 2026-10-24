@@ -1,10 +1,29 @@
-"""The SQLite store of the knowledge base (graphify.kb_store) and the move of old stores into it."""
+"""The stores of the knowledge base (graphify.kb_store), the move of old stores into SQLite and the export import."""
+import io
 import json
+import shutil
+from collections import Counter
+from pathlib import Path
+
+import pytest
 
 from graphify import kb as kb_module
 from graphify import kb_store
-from graphify.kb import KnowledgeBase, read_overlay
-from graphify.kb_store import STORE_FILE, Store, dumps, loads, read_store_overlay
+from graphify.kb import KBError, KnowledgeBase, import_export, read_overlay
+from graphify.kb_store import (
+    STORE_ENV,
+    STORE_FILE,
+    STORE_MARKER,
+    MemoryStore,
+    SQLiteStore,
+    dumps,
+    loads,
+    open_store,
+    read_store_overlay,
+    register_store,
+    store_factory,
+    store_names,
+)
 from tests.kb_fixtures import make_graph
 
 
@@ -16,7 +35,7 @@ def test_json_helpers_keep_the_data_of_json():
 
 
 def test_overlay_table_keeps_order_and_pending_writes(tmp_path):
-    store = Store(tmp_path / STORE_FILE)
+    store = SQLiteStore(tmp_path / STORE_FILE)
     nodes = store.overlay()["nodes"]
     nodes["x"] = {"id": "x"}
     nodes["y"] = {"id": "y"}
@@ -39,7 +58,7 @@ def test_overlay_table_keeps_order_and_pending_writes(tmp_path):
 
 def test_a_small_table_answers_missing_ids_without_a_query(tmp_path):
     path = tmp_path / STORE_FILE
-    store, other = Store(path), Store(path)
+    store, other = SQLiteStore(path), SQLiteStore(path)
     nodes = store.overlay()["nodes"]
     nodes["a"] = {"id": "a"}
     store.commit()
@@ -70,11 +89,11 @@ def test_a_small_table_answers_missing_ids_without_a_query(tmp_path):
 
 
 def test_backup_copies_the_store(tmp_path):
-    store = Store(tmp_path / STORE_FILE)
+    store = SQLiteStore(tmp_path / STORE_FILE)
     store.overlay()["edges"]["e"] = {"source": "a", "target": "b", "relation": "calls"}
     store.commit({"seq": 1, "op": "add_edge", "summary": "Add", "undo": []})
     store.backup(tmp_path / "copy.sqlite")
-    copy = Store(tmp_path / "copy.sqlite")
+    copy = SQLiteStore(tmp_path / "copy.sqlite")
     assert copy.overlay()["edges"].to_dict() == store.overlay()["edges"].to_dict()
     assert copy.history_count() == 1 and copy.seq() == store.seq()
 
@@ -158,7 +177,7 @@ def test_export_json_is_the_export_store_answer(tmp_path):
 def test_a_large_overlay_compresses_its_rows(tmp_path, monkeypatch):
     monkeypatch.setattr(kb_store, "ZDICT_ROWS", 50)
     path = tmp_path / STORE_FILE
-    store = Store(path)
+    store = SQLiteStore(path)
     nodes = store.overlay()["nodes"]
 
     def record(i):
@@ -217,3 +236,259 @@ def test_an_import_applies_its_overlay_once(tmp_path, monkeypatch):
     imported.close()
     again = KnowledgeBase(out / "graph.json")
     assert again.get_node(nid)["node"]["label"] == "Gateway" and len(calls) == 1
+
+
+@pytest.mark.parametrize("name", ["sqlite", "memory"])
+def test_each_store_keeps_order_pending_writes_and_history(tmp_path, name):
+    store = open_store(tmp_path, name)
+    nodes = store.overlay()["nodes"]
+    nodes["x"] = {"id": "x"}
+    nodes["y"] = {"id": "y"}
+    assert list(nodes) == ["x", "y"] and store.pending()
+    store.commit({"seq": 1, "op": "add_node", "summary": "Add", "undo": [["drop_node", "x"]]})
+    assert not store.pending() and store.seq() == 1 and store.history_count() == 1
+    nodes["x"] = {"id": "x", "label": "X"}
+    nodes["z"] = {"id": "z"}
+    del nodes["y"]
+    assert list(nodes) == ["x", "z"] and "y" not in nodes and len(nodes) == 2
+    store.discard()
+    assert nodes.to_dict() == {"x": {"id": "x"}, "y": {"id": "y"}}
+    nodes["x"]["label"] = "X"
+    assert "label" not in nodes["x"]
+    entry = next(store.history_entries())
+    assert entry["seq"] == 1 and entry["undo"] == [("drop_node", "x")]
+    assert store.read_overlay()["nodes"] == {"x": {"id": "x"}, "y": {"id": "y"}}
+    store.close()
+
+
+def test_a_knowledge_base_runs_on_the_memory_store(tmp_path):
+    graph = make_graph(tmp_path)
+    kb = KnowledgeBase(graph, store="memory")
+    nid = kb.add_node("Gateway", cls="concept")["id"]
+    kb.update_node(nid, {"owner": "core"})
+    assert kb.history_state()[0] >= 2
+    kb.undo()
+    assert "owner" not in kb.get_node(nid)["node"]
+    kb.flush()
+    kb.close()
+    folder = graph.parent / "kb"
+    assert not (folder / STORE_FILE).exists() and not (folder / STORE_MARKER).exists()
+    assert "Gateway" in graph.read_text(encoding="utf-8")
+
+
+def test_a_custom_store_marks_its_folder(tmp_path, monkeypatch):
+    monkeypatch.setattr(kb_store, "_FACTORIES", dict(kb_store._FACTORIES))
+    opened: list[Path] = []
+
+    class SavedStore(MemoryStore):
+        persistent = True
+
+    def factory(kb_dir):
+        opened.append(Path(kb_dir))
+        return SavedStore(kb_dir)
+
+    register_store("saved", factory)
+    assert "saved" in store_names()
+    with pytest.raises(ValueError, match="without ':'"):
+        register_store("a:b", factory)
+    graph = make_graph(tmp_path)
+    kb = KnowledgeBase(graph, store="saved")
+    kb.add_node("Gateway", cls="concept")
+    kb.close()
+    folder = graph.parent / "kb"
+    assert json.loads((folder / STORE_MARKER).read_text(encoding="utf-8")) == {"store": "saved"}
+    assert not (folder / STORE_FILE).exists()
+    # The marker picks the store of the folder, and another name cannot hide its edits.
+    again = KnowledgeBase(graph)
+    assert isinstance(again._store, SavedStore) and opened == [folder, folder]
+    again.close()
+    with pytest.raises(KBError, match="saved"):
+        KnowledgeBase(graph, store="sqlite")
+
+
+def test_a_saved_module_store_needs_an_explicit_name(tmp_path, monkeypatch):
+    monkeypatch.delenv(STORE_ENV, raising=False)
+    spec = "graphify.kb_store:MemoryStore"
+    assert store_factory(spec) is MemoryStore
+    with pytest.raises(ValueError, match="unknown knowledge base store"):
+        store_factory("no-such-store")
+    with pytest.raises(ValueError, match="cannot load"):
+        store_factory("graphify.no_such_module:Store")
+    graph = make_graph(tmp_path)
+    folder = graph.parent / "kb"
+    folder.mkdir()
+    # A cloned folder can name any module: only the caller can allow its code.
+    (folder / STORE_MARKER).write_text(json.dumps({"store": spec}), encoding="utf-8")
+    with pytest.raises(KBError, match="loads code"):
+        KnowledgeBase(graph)
+    KnowledgeBase(graph, store=spec).close()
+    monkeypatch.setenv(STORE_ENV, spec)
+    kb = KnowledgeBase(graph)
+    assert isinstance(kb._store, MemoryStore)
+    kb.close()
+
+
+def test_import_export_writes_a_store_that_opens_without_apply_overlay(tmp_path, monkeypatch):
+    (tmp_path / "a").mkdir()
+    graph = make_graph(tmp_path / "a")
+    kb = KnowledgeBase(graph)
+    nid = kb.add_node("Gateway", cls="concept")["id"]
+    kb.add_edge(nid, "a", "references")
+    doc = kb.create_document("Design", body="# Design\n", nodes=[nid])["id"]
+    kb.add_asset(doc, "chart.png", b"\x89PNG\r\n")
+    kb.flush()
+    # An export holds no history.
+    stats = {k: v for k, v in kb.stats().items() if k not in ("version", "graph", "history")}
+    exported = kb.export_json(assets=True)
+    kb.close()
+    out = tmp_path / "b" / "graphify-out"
+    counts = import_export(out, exported)
+    assert counts == {"nodes": stats["nodes"], "edges": stats["edges"], "documents": 1, "assets": 1}
+    calls = []
+    real = kb_module.apply_overlay
+    monkeypatch.setattr(kb_module, "apply_overlay", lambda *a, **k: calls.append(1) or real(*a, **k))
+    imported = KnowledgeBase(out / "graph.json")
+    assert calls == [] and imported.get_node(nid)["node"]["label"] == "Gateway"
+    assert {k: v for k, v in imported.stats().items() if k not in ("version", "graph", "history")} == stats
+    assert read_overlay(out) == read_overlay(graph.parent)
+    assert imported.get_document(doc)["body"] == "# Design\n"
+    assert imported.asset_path(doc, "chart.png").read_bytes() == b"\x89PNG\r\n"
+    imported.close()
+
+
+def test_an_open_store_reads_a_store_that_replaced_its_folder(tmp_path):
+    (tmp_path / "source").mkdir()
+    kb = KnowledgeBase(make_graph(tmp_path / "source"))
+    gateway = kb.add_node("Gateway", cls="concept")["id"]
+    first = kb.export_json()
+    invoices = kb.add_node("Invoices", cls="concept")["id"]
+    second = kb.export_json()
+    kb.close()
+    place = tmp_path / "copy"
+    import_export(place, first)
+    reader = KnowledgeBase(place / "graph.json")
+    assert reader.get_node(gateway)["node"]["label"] == "Gateway"
+    with pytest.raises(KBError):
+        reader.get_node(invoices)
+    # A new copy replaces the folder, as a snapshot does, while the reader keeps its connection.
+    import_export(tmp_path / "staging", second)
+    place.rename(tmp_path / "old")
+    (tmp_path / "staging").rename(place)
+    shutil.rmtree(tmp_path / "old")
+    assert reader.refresh_if_changed()
+    assert reader.get_node(invoices)["node"]["label"] == "Invoices"
+    reader.close()
+
+
+def test_import_export_refuses_other_data(tmp_path):
+    kb = KnowledgeBase(make_graph(tmp_path))
+    kb.add_node("Gateway", cls="concept")
+    exported = json.loads(kb.export_json())
+    kb.close()
+    out = tmp_path / "copy"
+    for name, match in [
+        ("../graph.json", "unsafe"),
+        ("/etc/graph.json", "unsafe"),
+        ("kb/.lock", "unsafe"),
+        ("kb/store.sqlite", "does not hold"),
+        ("kb/store.json", "does not hold"),
+        ("assets/chart.png", "does not hold"),
+    ]:
+        bad = {**exported, "files": [*exported["files"], {"path": name, "text": "x"}]}
+        with pytest.raises(KBError, match=match):
+            import_export(out, bad)
+    assert not out.exists()
+    with pytest.raises(KBError, match="not JSON"):
+        import_export(out, b"{")
+    with pytest.raises(KBError, match="not a knowledge base export"):
+        import_export(out, {"files": []})
+    with pytest.raises(KBError, match="no graph.json"):
+        import_export(out, {**exported, "files": [f for f in exported["files"] if f["path"] != "graph.json"]})
+    assert import_export(out, exported)["nodes"] == len(exported["files"][0]["json"]["nodes"])
+    with pytest.raises(KBError, match="already holds"):
+        import_export(out, exported)
+
+
+def test_validate_counts_every_finding_past_the_kept_head(tmp_path, monkeypatch):
+    monkeypatch.setattr(kb_module, "_REPORT_KEEP", 2)
+    graph = make_graph(tmp_path)
+    kb = KnowledgeBase(graph)
+    ids = [kb.add_node(f"Concept {i}", cls="concept")["id"] for i in range(4)]
+    kb.add_edge(ids[0], "a", "references")
+    kb.add_edge(ids[1], "a", "mentions")
+    kb.flush()
+    kb.close()
+    # A rebuild without the node a leaves two overlay edges out of the graph.
+    data = json.loads(graph.read_text(encoding="utf-8"))
+    data["nodes"] = [n for n in data["nodes"] if n["id"] != "a"]
+    data["links"] = [link for link in data["links"] if "a" not in (link["source"], link["target"])]
+    graph.write_text(json.dumps(data), encoding="utf-8")
+    kb = KnowledgeBase(graph)
+    # A limit past the kept head runs the full check again.
+    every = kb.validate(limit=1000)["findings"]
+    assert {f["severity"] for f in every} == {"warning", "info"}
+    for include_info in (True, False):
+        rows = every if include_info else [f for f in every if f["severity"] != "info"]
+        counts, codes = Counter(f["severity"] for f in rows), Counter(f["code"] for f in rows)
+        for limit in (0, 1, 2, 3, 1000):
+            report = kb.validate(limit=limit, include_info=include_info)
+            assert report["counts"] == {s: counts.get(s, 0) for s in kb_module.SEVERITIES}
+            assert list(report["by_code"].items()) == codes.most_common()
+            assert report["findings"] == rows[:limit]
+            assert (report["total"], report["truncated"]) == (len(rows), len(rows) > limit)
+    kb.close()
+
+
+def test_a_graph_without_communities_votes_again_when_one_comes(tmp_path):
+    def run(folder, *, reset):
+        folder.mkdir()
+        kb = KnowledgeBase(make_graph(folder))
+
+        def flush():
+            if reset:
+                kb._seedless = None
+            kb.flush()
+
+        x = kb.add_node("Gateway", cls="concept")["id"]
+        y = kb.add_node("Router", cls="concept")["id"]
+        kb.add_edge(x, y, "references")
+        flush()
+        skipped = kb._seedless
+        states = []
+        kb.update_node("a", {"community": 7})
+        kb.add_edge(y, "a", "references")
+        for attrs in ({}, {"community": None}):
+            if attrs:
+                kb.update_node("a", attrs)
+            flush()
+            states.append({n["label"]: (n.get("community"), n.get("_kb_community")) for n in kb.data["nodes"]})
+        kb.close()
+        return skipped, states
+
+    skipped, fast = run(tmp_path / "flag", reset=False)
+    _skipped, full = run(tmp_path / "full", reset=True)
+    assert skipped is True and fast == full
+    assert fast[0]["Gateway"] == fast[0]["Router"] == (7, True)
+    assert fast[1]["Gateway"] == (None, None)
+
+
+def test_the_compact_writer_writes_the_data_of_json_dumps(monkeypatch):
+    monkeypatch.setattr(kb_module, "_JSON_SLICE", 3)
+    data = {
+        "directed": True,
+        "graph": {"name": "Zażółć"},
+        "nodes": [{"id": f"n{i}", "label": f"Node {i} ✓", "w": i / 7} for i in range(50)],
+        "links": [{"source": f"n{i}", "target": f"n{i + 1}"} for i in range(13)],
+        "hyperedges": [],
+    }
+    for value in (data, {**data, "nodes": data["nodes"][:5]}, [1, 2], {1: "x"}):
+        buf = io.BytesIO()
+        kb_module._write_compact_json(buf, value)
+        assert json.loads(buf.getvalue()) == json.loads(json.dumps(value))
+
+    class Full(io.BytesIO):
+        def write(self, part):
+            raise OSError("disk full")
+
+    with pytest.raises(OSError, match="disk full"):
+        kb_module._write_compact_json(Full(), data)

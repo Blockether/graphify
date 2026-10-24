@@ -1,7 +1,7 @@
 """Editable knowledge base over a graphify ``graph.json``.
 
-The knowledge base keeps every edit in the overlay of ``graphify-out/kb/store.sqlite``
-(see ``graphify.kb_store``):
+The knowledge base keeps every edit in the overlay of its store,
+``graphify-out/kb/store.sqlite`` by default (see ``graphify.kb_store``):
 
 - nodes and edges that it created or changed;
 - attribute patches for nodes that the extractor created;
@@ -42,10 +42,12 @@ import time
 from array import array
 from bisect import bisect_right
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from itertools import accumulate
 from operator import itemgetter, methodcaller
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from queue import Queue
 from typing import Any, BinaryIO, Callable, Iterable, Iterator
 
 from graphify.ontology import (
@@ -70,7 +72,7 @@ from graphify.ontology import (
 from graphify.export import _CONFIDENCE_SCORE_DEFAULTS
 from graphify import kb_ingest
 from graphify.kb_ingest import safe_name, slugify
-from graphify.kb_store import STORE_FILE, HistoryView, Store, entry_from_blob, read_store_overlay
+from graphify.kb_store import HistoryView, KBStore, StoreFactory, mark_store, open_store
 from graphify.kb_store import dumps as _dumps_json
 from graphify.kb_store import loads as _loads_json
 from graphify.kb_link import LinkIndex, label_key, link_text, resolve_wiki, wiki_links
@@ -201,6 +203,29 @@ def _gc_paused() -> Iterator[None]:
         gc.enable()
 
 
+# ``KnowledgeBase.validate`` caches this many findings of each view.  The
+# server asks for 500, ``kb export`` for 2000.
+_REPORT_KEEP = 2000
+
+
+def _report_views(findings: list[dict[str, Any]], keep: int) -> dict[str, dict[str, Any]]:
+    """Return the counts and the first ``keep`` findings, with (``all``) and without (``issues``) info."""
+    severities = Counter(map(itemgetter("severity"), findings))
+    codes = Counter(map(itemgetter("code"), findings))
+    issues = [f for f in findings if f["severity"] != "info"] if severities.get("info") else findings
+    issue_codes = codes if issues is findings else Counter(map(itemgetter("code"), issues))
+
+    def view(rows: list[dict[str, Any]], counts: dict[str, int], by_code: Counter[str]) -> dict[str, Any]:
+        return {
+            "counts": {s: counts.get(s, 0) for s in SEVERITIES},
+            "by_code": dict(by_code.most_common()),
+            "head": rows[:keep],
+            "total": len(rows),
+        }
+
+    return {"all": view(findings, severities, codes), "issues": view(issues, {**severities, "info": 0}, issue_codes)}
+
+
 def _file_stat(path: Path) -> tuple[int, int, int] | None:
     """Return ``(inode, size, mtime_ns)`` of ``path``, or None without the file."""
     try:
@@ -228,23 +253,60 @@ def edge_id(source: Any, target: Any, relation: Any) -> str:
 _JSON_SLICE = 2000
 
 
-def _write_compact_json(fh: BinaryIO, data: Any) -> None:
-    """Write ``data`` as compact UTF-8 JSON, the same data as ``json.dumps``."""
+def _compact_parts(data: Any) -> Iterator[bytes | memoryview]:
+    """Yield ``data`` as compact UTF-8 JSON in parts, the same data as ``json.dumps``."""
     if not isinstance(data, dict) or not all(isinstance(k, str) for k in data):
-        fh.write(_dumps_json(data))
+        yield _dumps_json(data)
         return
-    fh.write(b"{")
+    yield b"{"
     for i, (key, value) in enumerate(data.items()):
-        fh.write((b"," if i else b"") + _dumps_json(key) + b":")
+        yield (b"," if i else b"") + _dumps_json(key) + b":"
         if isinstance(value, list) and len(value) > _JSON_SLICE:
-            fh.write(b"[")
+            yield b"["
             for start in range(0, len(value), _JSON_SLICE):
-                part = _dumps_json(value[start : start + _JSON_SLICE])
-                fh.write((b"," if start else b"") + part[1:-1])
-            fh.write(b"]")
+                if start:
+                    yield b","
+                yield memoryview(_dumps_json(value[start : start + _JSON_SLICE]))[1:-1]
+            yield b"]"
         else:
-            fh.write(_dumps_json(value))
-    fh.write(b"}")
+            yield _dumps_json(value)
+    yield b"}"
+
+
+def _write_compact_json(fh: BinaryIO, data: Any) -> None:
+    """Write ``data`` as compact UTF-8 JSON, the same data as ``json.dumps``.
+
+    For a large graph, a writer thread writes each slice while the next slice
+    encodes: the encoder holds the GIL, and a file write releases it.
+    """
+    big = isinstance(data, dict) and any(isinstance(v, list) and len(v) > 4 * _JSON_SLICE for v in data.values())
+    if not big:
+        for part in _compact_parts(data):
+            fh.write(part)
+        return
+    parts: Queue[bytes | memoryview | None] = Queue(maxsize=8)
+    failed: list[BaseException] = []
+
+    def drain() -> None:
+        while (part := parts.get()) is not None:
+            if not failed:
+                try:
+                    fh.write(part)
+                except BaseException as exc:  # noqa: BLE001 - the caller gets it
+                    failed.append(exc)
+
+    writer = threading.Thread(target=drain, name="graphify-kb-write", daemon=True)
+    writer.start()
+    try:
+        for part in _compact_parts(data):
+            if failed:
+                break
+            parts.put(part)
+    finally:
+        parts.put(None)
+        writer.join()
+    if failed:
+        raise failed[0]
 
 
 def _dump_atomic(path: Path, data: Any, *, compact: bool = False) -> None:
@@ -315,17 +377,19 @@ def is_kb_record(item: Any) -> bool:
 def read_overlay(out_dir: Path | str) -> dict[str, Any] | None:
     """Return the overlay of the knowledge base in ``out_dir``, or None without one.
 
-    A ``kb/overlay.json`` comes first: an import or a store from before
-    ``kb/store.sqlite`` wrote it, and the next store load moves it in.
+    A ``kb/overlay.json`` comes first: a store from before ``kb/store.sqlite``
+    wrote it, and the next store load moves it in.  Else the store of the
+    folder answers (see ``kb_store.open_store``).
     """
-    path = Path(out_dir) / "kb" / "overlay.json"
+    kb_dir = Path(out_dir) / "kb"
+    path = kb_dir / "overlay.json"
     if path.is_file():
         return _read_legacy_overlay(path)
-    store = Path(out_dir) / "kb" / STORE_FILE
     try:
-        return read_store_overlay(store)
-    except (sqlite3.Error, ValueError) as exc:
-        raise KBError(f"cannot read {store}: {exc}") from exc
+        with open_store(kb_dir) as store:
+            return store.read_overlay() if store.exists() else None
+    except (sqlite3.Error, ValueError, OSError) as exc:
+        raise KBError(f"cannot read the store of {kb_dir}: {exc}") from exc
 
 
 def _read_legacy_overlay(path: Path) -> dict[str, Any]:
@@ -1103,13 +1167,25 @@ class KnowledgeBase:
 
     _edge_index: dict[str, list[dict[str, Any]]] | None = None
 
-    def __init__(self, graph_path: Path | str, *, autoflush: bool = True, create: bool = True) -> None:
+    def __init__(
+        self,
+        graph_path: Path | str,
+        *,
+        autoflush: bool = True,
+        create: bool = True,
+        store: KBStore | StoreFactory | str | None = None,
+    ) -> None:
+        """Open the knowledge base of ``graph_path``.
+
+        ``store`` picks the backend of the overlay and the history: a backend
+        name, a factory that takes the ``kb`` folder, or a ``KBStore``.  None
+        keeps the backend of the folder (see ``kb_store.open_store``).
+        """
         self.graph_path = Path(graph_path).resolve()
         self.out_dir = self.graph_path.parent
         self.kb_dir = self.out_dir / "kb"
         self.docs_dir = self.kb_dir / "documents"
         self.trash_dir = self.kb_dir / "trash"
-        self.store_path = self.kb_dir / STORE_FILE
         # The files of a store from before ``store.sqlite``.  The store moves
         # them in when it finds them: an import writes ``overlay.json`` too.
         self.overlay_path = self.kb_dir / "overlay.json"
@@ -1140,16 +1216,23 @@ class KnowledgeBase:
         self._method_gen = 0
         self._method_rows: tuple[int, tuple[set[str] | None, set[str] | None]] | None = None
         self.version = 0
-        self._store = Store(self.store_path)
+        try:
+            self._store = open_store(self.kb_dir, store)
+        except (TypeError, ValueError) as exc:
+            raise KBError(str(exc)) from exc
         # The overlay tables and the history read the store on demand.
         self.overlay: dict[str, Any] = self._store.overlay()
         self.history = HistoryView(self._store)
         self.overlay_stats: dict[str, Any] = {}
         # Graph records that a change removed, until ``_compact`` (by ``id``).
         self._gone: dict[int, dict[str, Any]] = {}
+        # True when no node has a community to give and no KB node has a label
+        # of ``_assign_communities``; None until that step checks.
+        self._seedless: bool | None = None
         # The overlay of ``kb/overlay.json``, until ``_load`` writes it to the store.
         self._legacy_overlay: dict[str, Any] | None = None
         with self._lock, self._store_lock(create=self._create):
+            mark_store(self.kb_dir, self._store)
             self._import_legacy()
             self._load()
         self._maybe_flush()
@@ -1324,6 +1407,7 @@ class KnowledgeBase:
             data.setdefault(self.links_key, [])
             self.data = data
             self._gone = {}
+            self._seedless = None
             self._store.discard()
             legacy, self._legacy_overlay = self._legacy_overlay, None
             ready = None if legacy is not None else self._materialized(sig)
@@ -1497,15 +1581,28 @@ class KnowledgeBase:
         marks a label from this step, so each flush votes again with the edges
         of that time.  The next graphify build clusters the whole graph again.
         Return True when a community changed.
+
+        Without a community to give and without a label of this step, nothing
+        changes.  ``_seedless`` keeps that state until a node with a community
+        or a label comes in (``_raw_put_node``), so the flushes of a graph of
+        KB nodes alone make no pass over the nodes.
         """
+        if self._seedless:
+            return False
         todo: list[dict[str, Any]] = []
         seeds: list[dict[str, Any]] = []
+        labelled = False
         for n in self.data["nodes"]:
             cid = n.get("community")
-            if is_kb_record(n) and (cid is None or n.get("_kb_community")):
+            if n.get("_origin") == KB_ORIGIN and (cid is None or n.get("_kb_community")):
                 todo.append(n)
+                labelled = labelled or bool(n.get("_kb_community"))
             elif cid is not None and not isinstance(cid, bool):
                 seeds.append(n)
+        # Without seeds no node gets a vote, so only the old labels go.
+        self._seedless = not seeds
+        if not seeds and not labelled:
+            return False
         before = [(n.get("community"), n.get("community_name")) for n in todo]
         for node in todo:
             if node.pop("_kb_community", None):
@@ -1563,6 +1660,10 @@ class KnowledgeBase:
 
     # -- raw graph mutation (no overlay, no history) --------------------
     def _raw_put_node(self, rec: dict[str, Any]) -> None:
+        if self._seedless:
+            cid = rec.get("community")
+            if rec.get("_kb_community") or (cid is not None and not isinstance(cid, bool)):
+                self._seedless = False
         nid = str(rec["id"])
         node = self._nodes.get(nid)
         if node is None:
@@ -2030,13 +2131,13 @@ class KnowledgeBase:
         shared: set[str] = set()
         if not writes:
             return [], []
-        for seq, keys, blob in self._store.later_keys(first):
+        for seq, keys, entry in self._store.later_keys(first):
             if seq in undone:
                 continue
             if isinstance(keys, dict):
                 touched = set(keys.get("w") or ()) | set(keys.get("r") or ())
-            elif blob is not None:
-                w, r = self._entry_keys(entry_from_blob(blob))
+            elif entry is not None:
+                w, r = self._entry_keys(entry)
                 touched = w | r
             else:
                 continue
@@ -2193,7 +2294,11 @@ class KnowledgeBase:
                         if item.is_file() and not item.name.startswith("."):
                             data = base64.b64encode(item.read_bytes()).decode("ascii")
                             files.append({"path": f"{base}/assets/{item.name}", "base64": data})
-            head = _dumps_json({"format": "graphify-kb-export", "version": self.version, "exported_at": now_iso()})
+            info: dict[str, Any] = {"format": EXPORT_FORMAT, "version": self.version, "exported_at": now_iso()}
+            if not self._dirty:
+                # The graph is the flushed one, so an import can skip ``apply_overlay`` (see ``import_export``).
+                info["materialized"] = {"stats": {k: v for k, v in self.overlay_stats.items() if k in _PENDING_KEYS}}
+            head = _dumps_json(info)
             parts = [head[:-1], b',"files":[{"path":"graph.json","json":', _dumps_json(self.data), b"}"]
         for item in files:
             parts += [b",", _dumps_json(item)]
@@ -2907,34 +3012,40 @@ class KnowledgeBase:
         except (TypeError, ValueError):
             raise KBError(f"limit must be an integer, not {limit!r}") from None
         with self._lock:
-            full = self._cached("validate", self._full_report)
-            findings = full["findings"]
-            if not include_info:
-                findings = [f for f in findings if f["severity"] != "info"]
-            counts = Counter(f["severity"] for f in findings)
-            by_code = Counter(f["code"] for f in findings)
+            # The cache keeps the first findings only; a larger limit runs the check again.
+            full = self._full_report(limit) if limit > _REPORT_KEEP else self._cached("validate", self._full_report)
+            view = full["all" if include_info else "issues"]
             return {
-                "ok": counts.get("error", 0) == 0,
-                "counts": {s: counts.get(s, 0) for s in SEVERITIES},
-                "by_code": dict(by_code.most_common()),
+                "ok": view["counts"].get("error", 0) == 0,
+                "counts": dict(view["counts"]),
+                "by_code": dict(view["by_code"]),
                 "nodes": full["nodes"],
                 "edges": full["edges"],
-                "findings": _clone(findings[:limit]),
-                "truncated": len(findings) > limit,
-                "total": len(findings),
+                "findings": _clone(view["head"][:limit]),
+                "truncated": view["total"] > limit,
+                "total": view["total"],
                 "version": self.version,
             }
 
-    def _full_report(self) -> dict[str, Any]:
+    def _full_report(self, keep: int | None = None) -> dict[str, Any]:
+        """Run the full check.  Keep the counts and the first ``keep`` (default ``_REPORT_KEEP``) findings.
+
+        The other findings go while the collector is off: a large graph has
+        hundreds of thousands, and each one that stays makes each later full
+        collection slower.
+        """
         with _gc_paused():
             report = validate_graph(self.data, self.ontology, limit=sys.maxsize, include_info=True)
-            findings, extra = report["findings"], self._overlay_findings()
-        if extra:
-            # validate_graph sorts its own findings, so only the overlay findings need a new sort.
-            findings += extra
-            rank = {s: i for i, s in enumerate(SEVERITIES)}
-            findings.sort(key=lambda f: (rank.get(f["severity"], 9), f["code"]))
-        return {"findings": findings, "nodes": report["nodes"], "edges": report["edges"]}
+            findings, extra = report.pop("findings"), self._overlay_findings()
+            if extra:
+                # validate_graph sorts its own findings, so only the overlay findings need a new sort.
+                findings += extra
+                rank = {s: i for i, s in enumerate(SEVERITIES)}
+                findings.sort(key=lambda f: (rank.get(f["severity"], 9), f["code"]))
+            del extra
+            views = _report_views(findings, _REPORT_KEEP if keep is None else keep)
+            del findings
+        return {**views, "nodes": report["nodes"], "edges": report["edges"]}
 
     def _overlay_findings(self) -> list[dict[str, Any]]:
         """Report the overlay records that the graph cannot hold now (R6).
@@ -3734,3 +3845,138 @@ class KnowledgeBase:
             except KBError as exc:
                 skipped.append({"source": s, "target": t, "relation": rel, "reason": str(exc)})
         return [v for k, v in ids.items() if k in plan.nodes], edges, skipped
+
+
+EXPORT_FORMAT = "graphify-kb-export"
+
+
+def _export_parts(name: str) -> tuple[str, ...]:
+    """Return the parts of a file path of a store export.  Raise KBError for a path that an export does not hold."""
+    parts = PurePosixPath(name).parts
+    if not parts or name.startswith("/") or "\\" in name or ":" in name or any(p.startswith(".") for p in parts):
+        raise KBError(f"the export names an unsafe path: {name!r}")
+    known = (
+        parts in (("graph.json",), ("ontology.json",), ("kb", "overlay.json"))
+        or (len(parts) == 4 and parts[:2] == ("kb", "documents") and parts[3] in ("meta.json", "body.md"))
+        or (len(parts) == 5 and parts[:2] == ("kb", "documents") and parts[3] == "assets")
+    )
+    if not known:
+        raise KBError(f"the export names a file that a store export does not hold: {name!r}")
+    return parts
+
+
+def _write_export_files(jobs: list[tuple[Path, dict[str, Any]]]) -> None:
+    """Write the document files of an export.  Many small files go out in threads: a file write releases the GIL."""
+    for parent in {path.parent for path, _item in jobs}:
+        parent.mkdir(parents=True, exist_ok=True)
+
+    def put(job: tuple[Path, dict[str, Any]]) -> None:
+        path, item = job
+        if "json" in item:
+            raw = _dumps_json(item["json"])
+        elif "text" in item:
+            raw = str(item["text"]).encode("utf-8")
+        else:
+            try:
+                raw = base64.b64decode(str(item["base64"]))
+            except ValueError as exc:
+                raise KBError(f"the export has a broken file {path.name}: {exc}") from exc
+        path.write_bytes(raw)
+
+    if len(jobs) < 64:
+        for job in jobs:
+            put(job)
+        return
+    with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as pool:
+        for _done in pool.map(put, jobs):
+            pass
+
+
+def import_export(
+    out_dir: Path | str,
+    export: bytes | bytearray | memoryview | str | dict[str, Any],
+    *,
+    store: KBStore | StoreFactory | str | None = None,
+) -> dict[str, int]:
+    """Write a store export (``KnowledgeBase.export_json``) into the output folder ``out_dir``.
+
+    ``export`` is the export as JSON text or as a dict.  The overlay goes
+    straight into the store, so the first open does not move it in.  When the
+    export says that its graph holds the whole overlay, the store also records
+    that ``graph.json`` does, and the first open skips ``apply_overlay``.
+    ``store`` picks the backend, as for ``KnowledgeBase``; the folder must hold
+    no store yet.  Return the counts ``nodes``, ``edges``, ``documents`` and
+    ``assets``.  Raise KBError for data that is not a store export.
+
+    The files go out in a thread while the store takes the overlay.  After
+    another error, the folder can hold a part of the copy: remove it before
+    the next import.
+    """
+    if isinstance(export, dict):
+        data: Any = export
+    else:
+        try:
+            data = _loads_json(export)
+        except ValueError as exc:
+            raise KBError(f"the export is not JSON: {exc}") from exc
+    files = data.get("files") if isinstance(data, dict) else None
+    if not isinstance(data, dict) or data.get("format") != EXPORT_FORMAT or not isinstance(files, list):
+        raise KBError("the data is not a knowledge base export")
+    out = Path(out_dir)
+    graph: Any = None
+    overlay: Any = None
+    jobs: list[tuple[Path, dict[str, Any]]] = []
+    counts = {"nodes": 0, "edges": 0, "documents": 0, "assets": 0}
+    for item in files:
+        name = str(item.get("path") or "") if isinstance(item, dict) else ""
+        parts = _export_parts(name)
+        if not any(key in item for key in ("json", "text", "base64")):
+            raise KBError(f"the export has no content for {name}")
+        if parts == ("graph.json",):
+            graph = item.get("json")
+        elif parts == ("kb", "overlay.json"):
+            overlay = item.get("json")
+        else:
+            jobs.append((out.joinpath(*parts), item))
+            counts["assets"] += int("base64" in item)
+            counts["documents"] += int(parts[-1] == "meta.json" and len(parts) == 4)
+    if not isinstance(graph, dict) or not isinstance(graph.get("nodes"), list):
+        raise KBError("the export has no graph.json")
+    if overlay is not None and not isinstance(overlay, dict):
+        raise KBError("the overlay of the export is not a JSON object")
+    kb_dir = out / "kb"
+    try:
+        target = open_store(kb_dir, store)
+    except (TypeError, ValueError) as exc:
+        raise KBError(str(exc)) from exc
+    with target:
+        if target.exists():
+            raise KBError(f"{kb_dir} already holds a knowledge base store")
+        graph_path = out / "graph.json"
+
+        def write_files() -> None:
+            _dump_atomic(graph_path, graph, compact=True)
+            _write_export_files(jobs)
+
+        # SQLite and zstd release the GIL, so the file writes overlap the store writes.
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="graphify-kb-import") as pool:
+            written = pool.submit(write_files)
+            try:
+                if overlay is not None:
+                    kb_dir.mkdir(parents=True, exist_ok=True)
+                    with _file_lock(kb_dir / ".lock"):
+                        mark_store(kb_dir, target)
+                        seq = target.replace_overlay(overlay)
+                        written.result()
+                        mark = data.get("materialized")
+                        stats = mark.get("stats") if isinstance(mark, dict) else None
+                        stat = _file_stat(graph_path)
+                        if isinstance(stats, dict) and stat is not None:
+                            target.set_meta(materialized={"graph": list(stat), "seq": seq, "stats": stats})
+            finally:
+                failed = written.exception()
+            if failed is not None:
+                raise failed
+    counts["nodes"] = len(graph["nodes"])
+    counts["edges"] = len(graph.get("links", graph.get("edges")) or ())
+    return counts

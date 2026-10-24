@@ -914,6 +914,7 @@ def _run_cli() -> None:
         print("  kb validate [graph.json] check the graph against graphify-out/ontology.json")
         print("  kb infer [graph.json]   infer an ontology from the graph (--save writes ontology.json)")
         print("  kb ingest <file|url>... add documents (Markdown, PDF, HTML, images); --llm extracts nodes")
+        print("    --store <name>          store backend of each kb command (default sqlite; see docs/kb.md)")
         print("  cluster-only <path>     rerun clustering on an existing graph.json and regenerate report")
         print("    --no-viz                skip graph.html generation (useful for >5000 node graphs / CI)")
         print("    --graph <path>          path to graph.json (default <path>/graphify-out/graph.json)")

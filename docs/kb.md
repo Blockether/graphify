@@ -10,6 +10,8 @@
 - **You want to know where the graph is inconsistent.** Use [Ontology and findings](#ontology-and-findings).
 - **An agent or a script must read or change the graph.** Use [the HTTP API](#http-api).
 - **You want to share a view without a server.** Use [Static export](#static-export).
+- **You want to keep your edits outside SQLite**, for example in a database server or only in memory. Use [another store](#use-another-store).
+- **You want to copy a knowledge base to another folder or machine.** Use [Copy a store](#copy-a-store).
 
 For the code graph itself, read [How it works](how-it-works.md). For framework flows, read [Domain flows](domain.md).
 
@@ -60,6 +62,7 @@ The interface works with touch on a tablet and a phone.
 | `graphify-out/graph.json` | The graph. KB nodes and edges are part of it, next to the code nodes. |
 | `graphify-out/ontology.json` | The ontology. Without this file, graphify infers one from the graph. |
 | `graphify-out/kb/store.sqlite` | Your edits, the node moves that wait for a rebuild, and the change history with the data to undo each change. `graphify update`, `graphify extract` and `graphify watch` apply the edits again after each rebuild. |
+| `graphify-out/kb/store.json` | The name of the store backend, when the knowledge base does not use SQLite. See [Use another store](#use-another-store). |
 | `graphify-out/kb/generation.json` | The version number of the knowledge base. It only grows, also across restarts. |
 | `graphify-out/kb/documents/<id>/` | `meta.json`, `body.md` and `assets/` of one document. |
 | `graphify-out/kb/trash/` | Deleted documents and files, so that an undo can restore them. |
@@ -78,6 +81,55 @@ graphify kb move lib_util_parse lib_text_parse --json
 ```
 
 graphify keeps one edge between two nodes. If an edge already joins two nodes, a second edge between them fails with a conflict. Change the existing edge instead.
+
+### Use another store
+
+Your edits, the history and the node moves go into a store backend. The default backend is `sqlite`: the file `kb/store.sqlite`. The `memory` backend keeps them only while the process runs, for tests and short scripts.
+
+Select the backend in one of these ways:
+
+- Add `--store NAME` to a `graphify kb` command, for example `graphify kb serve --store memory`.
+- Give `store="NAME"` to `KnowledgeBase(graph_path, store="NAME")` in Python.
+- Set `GRAPHIFY_KB_STORE=NAME` for a folder that has no store yet.
+
+A name is a registered backend, an entry point of the group `graphify.kb_stores`, or `module:attr`. A persistent backend other than SQLite writes its name to `kb/store.json`, and the next open uses the same backend. An open with another name fails, so that your edits cannot seem lost.
+
+A `module:attr` name loads Python code, and a cloned folder can hold any `kb/store.json`. So graphify loads a `module:attr` name from `kb/store.json` only when `--store` or `GRAPHIFY_KB_STORE` gives the same name.
+
+To write a backend, subclass `graphify.kb_store.KBStore` and implement its primitive methods. The overlay tables, the history, undo and import build on them. `MemoryStore` in `graphify/kb_store.py` is a short complete example.
+
+```python
+from graphify.kb_store import KBStore, register_store
+
+
+class ServerStore(KBStore):
+    name = "server"
+
+    def __init__(self, kb_dir):
+        self.kb_dir = kb_dir  # connect to your server here
+
+    def exists(self): ...                       # True when the store holds data
+    def read_row(self, kind, key): ...          # a new copy of the record, or graphify.kb_store.MISSING
+    def row_count(self, kind, limit=None): ...
+    def row_items(self, kind): ...              # (id, record) pairs in insertion order
+    def write(self, changes, entry, meta): ...  # one atomic change; return the new commit counter
+    def meta(self, key, default=None): ...
+    def set_meta(self, **values): ...
+    def add_history(self, entries): ...
+    def history_entries(self, *, reverse=False, after=0): ...
+
+
+register_store("server", ServerStore)
+```
+
+The factory gets the `kb/` folder and returns a new store. A package can also declare it as an entry point:
+
+```toml
+[project.entry-points."graphify.kb_stores"]
+server = "my_package.store:ServerStore"
+```
+
+graphify calls a store from one thread at a time. The file lock `kb/.lock` orders the writers of other processes on the same machine. A store that machines share must order their writes itself.
 
 ## Documents
 
@@ -460,7 +512,9 @@ On the 47,817-node Vis graph, the overview is 126 KB with gzip, and the largest 
 - `ontology.json` is in the list only when the store has one. Without it, the copy infers the same ontology.
 - `assets=1` adds the files of the documents in base64, such as `{"path": "kb/documents/notes/assets/plan.png", "base64": "..."}`. Without it, the answer is smaller, but the copy has no images or attachments.
 - The history, the trash and the lock stay out. A copy starts with an empty history.
-- The first load of the copy moves `kb/overlay.json` into `kb/store.sqlite`.
+- In Python, `graphify.kb.import_export(folder, answer)` writes the copy into `folder`. It writes the edits straight into the store, so the first load of the copy is as fast as a later load. It refuses a folder that already has a store, and every path that is not in the list above.
+- `materialized` is in the answer when `graph.json` holds all edits. `import_export` then marks the graph as current, and the first load does not apply the edits again.
+- When you write the files yourself, the first load of the copy moves `kb/overlay.json` into the store.
 
 ### Caching
 

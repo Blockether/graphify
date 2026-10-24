@@ -73,6 +73,10 @@ def _parser() -> argparse.ArgumentParser:
     m.add_argument("ids", nargs="+", metavar="ID", help="pairs of an old and a new node id")
     m.add_argument("--graph")
     m.add_argument("--json", action="store_true")
+    for action in sub.choices.values():
+        action.add_argument("--store", metavar="NAME",
+                            help="store backend of a new knowledge base: sqlite (default), memory, an entry point "
+                                 "of graphify.kb_stores or module:attr (default $GRAPHIFY_KB_STORE)")
     return p
 
 
@@ -97,19 +101,19 @@ def main(argv: list[str] | None = None) -> int:
         if args.action == "serve":
             from graphify.kb_server import serve
 
-            serve(_graph(args.graph), host=args.host, port=args.port, token=args.token,
+            serve(_graph(args.graph), host=args.host, port=args.port, token=args.token, store=args.store,
                   read_only=args.read_only, allowed_hosts=args.allow_host or None,
                   open_browser=args.open)
             return 0
         if args.action == "export":
             from graphify.kb_html import write_static_html
 
-            kb = KnowledgeBase(_graph(args.graph), create=False)
+            kb = KnowledgeBase(_graph(args.graph), create=False, store=args.store)
             target = write_static_html(kb, args.out, name=args.name)
             print(f"Wrote {target} ({target.stat().st_size // 1024} KiB)")
             return 0
         if args.action == "validate":
-            kb = KnowledgeBase(_graph(args.graph), create=False)
+            kb = KnowledgeBase(_graph(args.graph), create=False, store=args.store)
             report = kb.validate(limit=max(args.limit, 1), include_info=not args.no_info)
             if args.json:
                 print(json.dumps(report, indent=2, default=str))
@@ -117,7 +121,7 @@ def main(argv: list[str] | None = None) -> int:
                 _print_report(report, args.limit)
             return 1 if args.strict and report["counts"].get("error", 0) else 0
         if args.action == "infer":
-            kb = KnowledgeBase(_graph(args.graph), create=False)
+            kb = KnowledgeBase(_graph(args.graph), create=False, store=args.store)
             onto = kb.infer_ontology(save=args.save)
             if args.json:
                 print(json.dumps(onto, indent=2, default=str))
@@ -127,7 +131,7 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"Saved {kb.onto_path}")
             return 0
         if args.action == "ingest":
-            kb = KnowledgeBase(_graph(args.graph), create=True)
+            kb = KnowledgeBase(_graph(args.graph), create=True, store=args.store)
             results = []
             for source in args.sources:
                 common = dict(mode="llm" if args.llm else "text", title=args.title,
@@ -156,7 +160,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.action == "move":
             if len(args.ids) % 2:
                 raise KBError("move takes pairs of node ids: <old id> <new id> [<old id> <new id>]...")
-            kb = KnowledgeBase(_graph(args.graph), create=False)
+            kb = KnowledgeBase(_graph(args.graph), create=False, store=args.store)
             pairs = zip(args.ids[::2], args.ids[1::2])
             results = kb.batch([{"op": "move_node", "from": old, "to": new} for old, new in pairs], actor="cli")
             kb.flush()
