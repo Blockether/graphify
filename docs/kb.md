@@ -59,7 +59,7 @@ The interface works with touch on a tablet and a phone.
 |---|---|
 | `graphify-out/graph.json` | The graph. KB nodes and edges are part of it, next to the code nodes. |
 | `graphify-out/ontology.json` | The ontology. Without this file, graphify infers one from the graph. |
-| `graphify-out/kb/overlay.json` | Your edits. `graphify update`, `graphify extract` and `graphify watch` apply them again after each rebuild. |
+| `graphify-out/kb/overlay.json` | Your edits, and the node moves that wait for a rebuild. `graphify update`, `graphify extract` and `graphify watch` apply them again after each rebuild. |
 | `graphify-out/kb/history.jsonl` | One line for each change, with the data to undo it. |
 | `graphify-out/kb/generation.json` | The version number of the knowledge base. It only grows, also across restarts. |
 | `graphify-out/kb/documents/<id>/` | `meta.json`, `body.md` and `assets/` of one document. |
@@ -67,7 +67,9 @@ The interface works with touch on a tablet and a phone.
 
 Nodes that you add get ids that start with `kb:`. Document nodes start with `doc:`. A new KB node joins the community that most of its neighbours belong to.
 
-An edit of an extracted node keeps the file, the label and the class of that node. When a rebuild gives the node a new id, the edit moves to the new id. graphify looks for one node with the same file, label and class. When the file was moved or renamed, one node with that label and class in the whole graph also counts. Otherwise the edit waits, and the `stale_overlay_patch` finding names it.
+An edit of an extracted node keeps the file, the label and the class of that node. A KB edge keeps them for each extracted end node. When a rebuild gives the node a new id, the edit and the edge move to the new id. graphify looks for one node with the same file, label and class. When the file was moved or renamed, one node with that label and class in the whole graph also counts. Otherwise the record waits, and the `stale_overlay_patch` or `stale_overlay_edge` finding names it.
+
+A rename changes the label, so this search cannot find the node. After a rename, send `{"op": "move_node", "from": "<old id>", "to": "<new id>"}` to `POST /api/batch`. The edits, edges and deletions of the old id then move to the new id. While the graph still has the old id, the move waits for the next rebuild (`"status": "pending"`). When the graph has the new code already, the records move at once (`"moved"`). An undo removes a move that waits, but records that moved stay at the new id.
 
 graphify keeps one edge between two nodes. If an edge already joins two nodes, a second edge between them fails with a conflict. Change the existing edge instead.
 
@@ -303,7 +305,10 @@ An `ontology.json` of version 1 still loads. Its rules count as inferred.
 | `orphan_node` | info | A KB node has no edges. |
 | `stale_overlay_patch` | warning | An edit waits: no node has its id now, and no single node fits its file, label and class. |
 | `rekeyed_overlay_patch` | info | An edit moved to a new node id after a rebuild. Check that the new node is the right one. |
-| `stale_overlay_edge` | warning | A KB edge waits for a node that the graph does not have now. |
+| `rekeyed_overlay_edge` | info | A KB edge moved to new node ids after a rebuild. Check that the new nodes are the right ones. |
+| `moved_overlay_node` | info | The records of a node moved to its new id after a `move_node` operation. |
+| `pending_overlay_move` | info | A `move_node` operation waits for a rebuild that removes the old id. |
+| `stale_overlay_edge` | warning | A KB edge waits: the graph has no node with its id now, and no single node fits its file, label and class. |
 | `overlay_conflict` | warning | A KB edge stays out, because another edge already joins the two nodes. |
 | `dangling_edge`, `duplicate_id` | error | An edge names a missing node, or an id appears twice. |
 | `unknown_class`, `unknown_relation` | warning | The ontology does not define the class or relation. With `strict: true` in the ontology, this is an error. |
@@ -346,7 +351,7 @@ This section is a reference for agents and scripts. All routes return JSON.
 | `GET /api/nodes/<id>`, `GET /api/nodes?label=` | One node with its connections. |
 | `POST /api/nodes`, `PATCH /api/nodes/<id>`, `DELETE /api/nodes/<id>` | Add, change (`{"attrs": {...}}`, `null` removes a key) or delete a node. |
 | `POST /api/edges`, `PATCH`/`DELETE /api/edges/<id>` | Add, change or delete an edge. |
-| `POST /api/batch` | `{"ops": [...]}`, all or nothing. |
+| `POST /api/batch` | `{"ops": [...]}`, all or nothing. `move_node` moves the records of a renamed node. |
 | `GET`/`PUT /api/ontology`, `POST /api/ontology/infer` | Read, replace or infer the ontology. |
 | `PUT`/`DELETE /api/ontology/classes/<name>` and `/relations/<name>` | Edit one class or relation. |
 | `GET /api/validate?limit=&info=` | Findings. `info=0` leaves out info findings. |

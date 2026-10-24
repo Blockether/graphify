@@ -4,6 +4,7 @@ import json
 import pytest
 
 from graphify.kb import (
+    EDGE_ANCHOR,
     PATCH_ANCHOR,
     Conflict,
     KBError,
@@ -431,6 +432,127 @@ def test_kb_rekeys_a_patch_after_a_rename_and_keeps_it(tmp_path):
     assert [(f["from"], f["node"], f["severity"]) for f in found] == [("a", "src_a", "info")]
     stored = json.loads((graph.parent / "kb" / "overlay.json").read_text(encoding="utf-8"))
     assert list(stored["patches"]) == ["src_a"]
+
+
+def _rebuild(graph, base, changes):
+    """Write graph.json like a graphify rebuild of ``base`` after a code change.
+
+    ``changes`` maps a node id to new attributes.  A new ``id`` moves the
+    node, and the rebuild extracts its edges with that id.
+    """
+    data = json.loads(json.dumps(base))
+    ids = {old: attrs["id"] for old, attrs in changes.items() if "id" in attrs}
+    for node in data["nodes"]:
+        node.update(changes.get(node["id"], {}))
+    for link in data["links"]:
+        link["source"] = ids.get(link["source"], link["source"])
+        link["target"] = ids.get(link["target"], link["target"])
+    graph.write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_kb_edge_follows_a_file_rename(tmp_path):
+    # A KB edge to a code node waited for the old id after a file rename
+    # (stale_overlay_edge).  The anchor of its code end now finds the node.
+    graph = make_graph(tmp_path)
+    base = json.loads(graph.read_text(encoding="utf-8"))
+    store = KnowledgeBase(graph)
+    lease = store.add_node("Lease", cls="concept")["id"]
+    store.add_edge(lease, "a", "references")
+    old_eid, new_eid = edge_id(lease, "a", "references"), edge_id(lease, "src_a", "references")
+    assert store.overlay["edges"][old_eid][EDGE_ANCHOR] == {
+        "target": {"source_file": "a.py", "label": "Alpha", "class": "code"}
+    }
+    _rebuild(graph, base, {"a": {"id": "src_a", "source_file": "src/a.py"}, "r": {"source_file": "src/a.py"}})
+    store.refresh_if_changed()
+    assert any(x["source"] == lease and x["target"] == "src_a" for x in store.data["links"])
+    found = [f for f in store.validate()["findings"] if f["code"] in ("rekeyed_overlay_edge", "stale_overlay_edge")]
+    assert [(f["code"], f["from"], f["edge"]["id"]) for f in found] == [("rekeyed_overlay_edge", old_eid, new_eid)]
+    stored = json.loads((graph.parent / "kb" / "overlay.json").read_text(encoding="utf-8"))
+    assert list(stored["edges"]) == [new_eid]
+    assert stored["edges"][new_eid][EDGE_ANCHOR]["target"]["source_file"] == "src/a.py"
+    store.flush()
+    assert not any(EDGE_ANCHOR in x for x in json.loads(graph.read_text(encoding="utf-8"))["links"])
+
+
+def test_move_node_waits_for_the_rebuild_and_moves_every_record(tmp_path):
+    graph = make_graph(tmp_path)
+    base = json.loads(graph.read_text(encoding="utf-8"))
+    store = KnowledgeBase(graph)
+    lease = store.add_node("Lease", cls="concept")["id"]
+    store.add_edge(lease, "a", "references")
+    store.update_node("a", {"owner": "team"})
+    store.update_edge(edge_id("a", "b", "calls"), {"note": "hot path"})
+    store.delete_edge(edge_id("r", "a", "rationale_for"))
+    assert store.batch([{"op": "move_node", "from": "a", "to": "a_v2"}]) == [
+        {"from": "a", "to": "a_v2", "status": "pending"}
+    ]
+    assert "pending_overlay_move" in {f["code"] for f in store.validate()["findings"]}
+    # A rename changes the label too, so no anchor finds the node.
+    _rebuild(graph, base, {"a": {"id": "a_v2", "label": "AlphaV2"}})
+    store.refresh_if_changed()
+    assert store.get_node("a_v2")["node"]["owner"] == "team"
+    links = {(x["source"], x["target"], x["relation"]): x for x in store.data["links"]}
+    assert (lease, "a_v2", "references") in links
+    assert links[("a_v2", "b", "calls")]["note"] == "hot path"
+    assert ("r", "a_v2", "rationale_for") not in links
+    codes = {f["code"] for f in store.validate()["findings"]}
+    assert "moved_overlay_node" in codes and "pending_overlay_move" not in codes
+    assert not {"stale_overlay_patch", "stale_overlay_edge"} & codes
+    stored = json.loads((graph.parent / "kb" / "overlay.json").read_text(encoding="utf-8"))
+    assert stored["moved_nodes"] == {} and list(stored["patches"]) == ["a_v2"]
+    assert stored["patches"]["a_v2"][PATCH_ANCHOR]["label"] == "AlphaV2"
+    assert edge_id("r", "a_v2", "rationale_for") in stored["deleted_edges"]
+
+
+def test_move_node_moves_the_records_at_once_after_the_rebuild(tmp_path):
+    graph = make_graph(tmp_path)
+    base = json.loads(graph.read_text(encoding="utf-8"))
+    store = KnowledgeBase(graph)
+    lease = store.add_node("Lease", cls="concept")["id"]
+    store.add_edge(lease, "a", "references")
+    store.update_node("a", {"owner": "team"})
+    _rebuild(graph, base, {"a": {"id": "a_v2", "label": "AlphaV2"}})
+    store.refresh_if_changed()
+    assert {"stale_overlay_patch", "stale_overlay_edge"} <= {f["code"] for f in store.validate()["findings"]}
+    assert store.batch([{"op": "move_node", "from": "a", "to": "a_v2"}]) == [
+        {"from": "a", "to": "a_v2", "status": "moved"}
+    ]
+    assert store.get_node("a_v2")["node"]["owner"] == "team"
+    assert any(x["source"] == lease and x["target"] == "a_v2" for x in store.data["links"])
+    assert store.overlay["moved_nodes"] == {}
+    # The code moved, so an undo keeps the records at the new id.
+    store.undo()
+    assert store.get_node("a_v2")["node"]["owner"] == "team"
+
+
+def test_move_node_undo_skip_and_refusals(kb):
+    assert kb.batch([{"op": "move_node", "from": "a", "to": "a_v2"}])[0]["status"] == "pending"
+    kb.undo()
+    assert kb.overlay["moved_nodes"] == {}
+    entries = len(kb.history)
+    assert kb.move_node("gone", "elsewhere")["status"] == "skipped"
+    assert len(kb.history) == entries and kb.overlay["moved_nodes"] == {}
+    lease = kb.add_node("Lease", cls="concept")["id"]
+    with pytest.raises(KBError, match="knowledge-base node"):
+        kb.move_node(lease, "a")
+    with pytest.raises(KBError, match="same node"):
+        kb.move_node("a", "a")
+
+
+def test_moves_follow_a_chain_and_drop_a_revert():
+    # Two renames before a rebuild: a -> b -> c.  The graph has c.
+    data = {"nodes": [_fn("c", "c()", "app.py")], "links": []}
+    overlay = _overlay(patches={"a": {"owner": "team"}}, moved_nodes={"a": "b", "b": "c", "x": "y"})
+    stats = apply_overlay(data, overlay)
+    assert data["nodes"][0]["owner"] == "team" and list(overlay["patches"]) == ["c"]
+    assert stats["applied_moves"] == [{"from": "a", "to": "c"}, {"from": "b", "to": "c"}]
+    # No record of x and no move to x, so nothing can follow its move.
+    assert overlay["moved_nodes"] == {} and stats["overlay_changed"]
+    # A rename and its revert before a rebuild: the graph has a again.
+    data = {"nodes": [_fn("a", "a()", "app.py")], "links": []}
+    overlay = _overlay(patches={"a": {"owner": "team"}}, moved_nodes={"a": "b", "b": "a"})
+    apply_overlay(data, overlay)
+    assert overlay["moved_nodes"] == {} and data["nodes"][0]["owner"] == "team"
 
 
 def test_undo_uses_the_footprint_from_write_time(tmp_path):

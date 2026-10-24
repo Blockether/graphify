@@ -268,6 +268,7 @@ def _empty_overlay() -> dict[str, Any]:
         "deleted_nodes": {},
         "edges": {},
         "deleted_edges": {},
+        "moved_nodes": {},
     }
 
 
@@ -320,14 +321,20 @@ def apply_overlay(
     - Graphify keeps at most one edge between two nodes.  An overlay edge
       between nodes that another edge joins stays out (``conflicts``).
     - An overlay edge without both end nodes stays out (``dangling``).
+    - A node move (``move_node``) sends the records of the old id to the new
+      id when the graph has the new code (``applied_moves``, see
+      ``_apply_moves``).
     - A patch follows its node to a new id through its anchor (see
       ``PATCH_ANCHOR``); the overlay keeps it under the new id
       (``rekeyed_patches``).  A patch without a node stays out (``stale_patches``).
+    - An overlay edge follows its end nodes the same way (see ``EDGE_ANCHOR``
+      and ``rekeyed_edges``).
 
     The overlay keeps the records that stay out, so they come back when the
     graph has their nodes again.  Return the counts of the changes, and the ids
     of the records that stay out in ``conflict_edges``, ``dangling_edges`` and
-    ``stale_patch_nodes`` (sorted).
+    ``stale_patch_nodes`` (sorted).  ``overlay_changed`` is True when the
+    overlay changed too (new ids, anchors or moves), so its owner saves it.
     """
     key = links_key or ("links" if "links" in data or "edges" not in data else "edges")
     if directed is None:
@@ -339,6 +346,7 @@ def apply_overlay(
     patches = overlay.get("patches") or {}
     deleted_nodes = overlay.get("deleted_nodes") or {}
     deleted_edges = overlay.get("deleted_edges") or {}
+    moves = overlay.get("moved_nodes") or {}
     stats = {
         "nodes_added": 0, "nodes_updated": 0, "nodes_removed": 0, "nodes_patched": 0,
         "edges_added": 0, "edges_updated": 0, "edges_removed": 0,
@@ -347,6 +355,12 @@ def apply_overlay(
     conflict_edges: list[str] = []
     dangling_edges: list[str] = []
     stale_patch_nodes: list[str] = []
+    applied_moves: list[dict[str, str]] = []
+    moves_changed = False
+    if moves:
+        applied_moves, moves_changed = _apply_moves(
+            moves, nodes, links, patches, deleted_nodes, ov_edges, deleted_edges
+        )
 
     by_id: dict[str, dict[str, Any]] = {}
     removed: set[str] = set()
@@ -397,6 +411,7 @@ def apply_overlay(
             patches[new_id] = patch
             rekeyed.append({"from": nid, "to": new_id})
             node = by_id[new_id]
+            _refresh_anchor(patch, node)
         elif PATCH_ANCHOR not in patch:
             anchor = _derive_anchor(node, patch)
             if anchor is not None:
@@ -434,22 +449,42 @@ def apply_overlay(
         kept_links.append(link)
         by_eid.setdefault(eid, link)
         by_pair.setdefault(_pair_key(s, t, directed), link)
-    for eid, rec in ov_edges.items():
+    rekeyed_edges: list[dict[str, str]] = []
+    edges_anchored = 0
+    edge_lookup: tuple[dict, dict, set[str]] | None = None
+    for eid, rec in list(ov_edges.items()):
+        eid = str(eid)
         s, t = str(rec.get("source")), str(rec.get("target"))
+        refresh: tuple[str, ...] = ()
         if s not in by_id or t not in by_id:
-            dangling_edges.append(str(eid))
-            continue
+            if edge_lookup is None:
+                edge_lookup = _anchor_lookup(kept_nodes, patches)
+            ends = _follow_edge(rec, by_id, edge_lookup, deleted_nodes)
+            new_eid = edge_id(ends[0], ends[1], rec.get("relation")) if ends else ""
+            if not ends or new_eid in ov_edges:
+                dangling_edges.append(eid)
+                continue
+            # The end nodes have new ids (a file rename): the edge follows
+            # them, and the overlay keeps it under the new id.
+            refresh = tuple(end for end, nid in (("source", s), ("target", t)) if nid not in by_id)
+            del ov_edges[eid]
+            rec["source"], rec["target"] = ends
+            ov_edges[new_eid] = rec
+            rekeyed_edges.append({"from": eid, "to": new_eid})
+            eid, (s, t) = new_eid, ends
+        edges_anchored += int(_anchor_edge(rec, by_id, patches, refresh))
+        clean = {k: v for k, v in rec.items() if k != EDGE_ANCHOR}
         current = by_eid.get(eid)
         if current is not None:
-            if current != rec:
+            if current != clean:
                 current.clear()
-                current.update(copy.deepcopy(rec))
+                current.update(copy.deepcopy(clean))
                 stats["edges_updated"] += 1
             continue
         if _pair_key(s, t, directed) in by_pair:
-            conflict_edges.append(str(eid))
+            conflict_edges.append(eid)
             continue
-        new = copy.deepcopy(rec)
+        new = copy.deepcopy(clean)
         kept_links.append(new)
         by_eid[eid] = new
         by_pair[_pair_key(s, t, directed)] = new
@@ -459,12 +494,16 @@ def apply_overlay(
     stats["dangling"] = len(dangling_edges)
     stats["stale_patches"] = len(stale_patch_nodes)
     stats["patches_anchored"] = anchored
+    stats["edges_anchored"] = edges_anchored
     return {
         **stats,
         "conflict_edges": sorted(conflict_edges),
         "dangling_edges": sorted(dangling_edges),
         "stale_patch_nodes": sorted(stale_patch_nodes),
         "rekeyed_patches": sorted(rekeyed, key=lambda r: r["from"]),
+        "rekeyed_edges": sorted(rekeyed_edges, key=lambda r: r["from"]),
+        "applied_moves": applied_moves,
+        "overlay_changed": bool(moves_changed or rekeyed or anchored or rekeyed_edges or edges_anchored),
     }
 
 
@@ -473,6 +512,11 @@ def apply_overlay(
 # so a file rename or a new id scheme gives the node a new id.  The anchor
 # finds the node again (memo R6).
 PATCH_ANCHOR = "_anchor"
+# An overlay edge keeps the anchors of its code end nodes under this key
+# (``{"source": anchor, "target": anchor}``), so it follows a file rename like
+# a patch.  KB nodes keep their ids and need no anchor.  The graph never shows
+# this key.
+EDGE_ANCHOR = "_anchors"
 # Node keys that decide the anchor (``taxonomy_class`` reads the rest).
 _ANCHOR_KEYS = frozenset({
     "label", "source_file", "class", "file_type", "node_kind", "metadata", "type",
@@ -509,15 +553,19 @@ def _derive_anchor(node: dict[str, Any], patch: dict[str, Any]) -> dict[str, str
     return patch_anchor(node)
 
 
-def _anchor_lookup(nodes: list[dict[str, Any]]) -> tuple[dict, dict, set[str]]:
+def _anchor_lookup(
+    nodes: list[dict[str, Any]], patches: dict[str, Any] | None = None
+) -> tuple[dict, dict, set[str]]:
+    """Index the code nodes by anchor.  With ``patches``, a patched node gives
+    the anchor of its patch: the extracted values, not the patched ones."""
     by_file: dict[tuple[str, str, str], list[str]] = {}
     by_label: dict[tuple[str, str], list[str]] = {}
     files: set[str] = set()
     for node in nodes:
         if is_kb_record(node):
             continue
-        anchor = patch_anchor(node)
         nid = str(node.get("id"))
+        anchor = (_node_anchor(node, patches.get(nid)) if patches is not None else None) or patch_anchor(node)
         by_file.setdefault((anchor["source_file"], anchor["label"], anchor["class"]), []).append(nid)
         by_label.setdefault((anchor["label"], anchor["class"]), []).append(nid)
         files.add(anchor["source_file"])
@@ -556,11 +604,218 @@ def _resolve_anchor(
     return None
 
 
-# Keys of the ``apply_overlay`` result that report records that stay out.
+def _refresh_anchor(patch: dict[str, Any], node: dict[str, Any]) -> None:
+    """Give a patch that followed its node to a new id the anchor of that node.
+
+    The old anchor stays when the node already shows a patched anchor value.
+    """
+    fresh = _derive_anchor(node, patch)
+    if fresh is not None:
+        patch[PATCH_ANCHOR] = fresh
+
+
+def _node_anchor(node: dict[str, Any], patch: Any) -> dict[str, str] | None:
+    """Return the anchor of the code node at one end of an edge, or None.
+
+    A KB node keeps its id, so it needs no anchor.  A patched node shows its
+    patched values; the anchor of its patch holds the extracted ones.
+    """
+    if is_kb_record(node):
+        return None
+    if isinstance(patch, dict):
+        anchor = patch.get(PATCH_ANCHOR)
+        return dict(anchor) if isinstance(anchor, dict) else None
+    return patch_anchor(node)
+
+
+def _anchor_edge(
+    rec: dict[str, Any],
+    by_id: dict[str, dict[str, Any]],
+    patches: dict[str, Any],
+    refresh: tuple[str, ...] = (),
+) -> bool:
+    """Give an overlay edge the anchors of its code end nodes (``EDGE_ANCHOR``).
+
+    An end keeps its anchor unless ``refresh`` names it: the edge just followed
+    that end to a new id.  Return True when an anchor changed.
+    """
+    old = rec.get(EDGE_ANCHOR)
+    anchors = dict(old) if isinstance(old, dict) else {}
+    changed = False
+    for end in ("source", "target"):
+        if end in anchors and end not in refresh:
+            continue
+        nid = str(rec.get(end))
+        node = by_id.get(nid)
+        anchor = None if node is None else _node_anchor(node, patches.get(nid))
+        if anchor is not None and anchors.get(end) != anchor:
+            anchors[end] = anchor
+            changed = True
+    if changed:
+        rec[EDGE_ANCHOR] = anchors
+    return changed
+
+
+def _follow_edge(
+    rec: dict[str, Any],
+    by_id: dict[str, dict[str, Any]],
+    lookup: tuple[dict, dict, set[str]],
+    deleted_nodes: dict[str, Any],
+) -> tuple[str, str] | None:
+    """Return the end ids that an overlay edge names now, or None.
+
+    An end that the graph has keeps its id.  A missing end needs an anchor
+    that names one node (``_resolve_anchor``).  That node can have its own
+    patch: an edge does not compete with a patch.
+    """
+    found = rec.get(EDGE_ANCHOR)
+    anchors = found if isinstance(found, dict) else {}
+    ends: list[str] = []
+    for end in ("source", "target"):
+        nid = str(rec.get(end))
+        if nid not in by_id:
+            nid = _resolve_anchor(anchors.get(end), lookup, {}, deleted_nodes) or ""
+            if not nid:
+                return None
+        ends.append(nid)
+    return ends[0], ends[1]
+
+
+def _move_target(old: str, moves: dict[str, Any], present: Any) -> str | None:
+    """Return the first id on the move chain of ``old`` that ``present`` has.
+
+    Two renames before a rebuild give the chain ``old -> b -> c``.  A chain
+    that comes back to an id on it (a rename and its revert) has no target.
+    """
+    seen = {old}
+    nid = old
+    while True:
+        nxt = moves.get(nid)
+        if not isinstance(nxt, str) or not nxt or nxt in seen:
+            return None
+        if nxt in present:
+            return nxt
+        seen.add(nxt)
+        nid = nxt
+
+
+def _move_returns(old: str, moves: dict[str, Any]) -> bool:
+    """Return True when the move chain of ``old`` comes back to ``old``."""
+    seen: set[str] = set()
+    nid = old
+    while nid not in seen:
+        seen.add(nid)
+        nxt = moves.get(nid)
+        if not isinstance(nxt, str):
+            return False
+        if nxt == old:
+            return True
+        nid = nxt
+    return False
+
+
+def _has_records(nid: str, patches: dict[str, Any], deleted_nodes: dict[str, Any], ov_edges: dict[str, Any]) -> bool:
+    """Return True when the overlay has a patch, a deletion or an edge of node ``nid``."""
+    if nid in patches or nid in deleted_nodes:
+        return True
+    return any(
+        isinstance(rec, dict) and nid in (str(rec.get("source")), str(rec.get("target")))
+        for rec in ov_edges.values()
+    )
+
+
+def _apply_moves(
+    moves: dict[str, Any],
+    nodes: list[dict[str, Any]],
+    links: list[dict[str, Any]],
+    patches: dict[str, Any],
+    deleted_nodes: dict[str, Any],
+    ov_edges: dict[str, Any],
+    deleted_edges: dict[str, Any],
+) -> tuple[list[dict[str, str]], bool]:
+    """Send the overlay records of moved nodes to their new ids.
+
+    ``moves`` maps an old node id to its new id (``move_node``).  A move waits
+    while the graph has the old id: the graph does not have the new code yet.
+    Then the patch, the deletion, the overlay edges and the deleted edges of
+    the old id go to the first id on the move chain that the graph has, and
+    the move goes.  A record stays under the old id when the new id has its
+    own record of the same kind.  A move without a target stays only while
+    the overlay has records of the old id or another move leads to it.  A
+    chain that comes back to an id that the graph has goes: the code was
+    renamed and renamed back.  Return the applied moves (sorted) and True
+    when the overlay changed.
+    """
+    present = {str(node.get("id")): node for node in nodes}
+    targets = {str(value) for value in moves.values()}
+    resolved: dict[str, str] = {}
+    changed = False
+    reverted: list[str] = []
+    for old in sorted(moves):
+        if old in present:
+            if _move_returns(old, moves):
+                reverted.append(old)  # a rename and its revert: the code has the old id again
+            continue
+        new = _move_target(old, moves, present)
+        if new is not None:
+            resolved[old] = new
+        elif old not in targets and not _has_records(old, patches, deleted_nodes, ov_edges):
+            del moves[old]  # nothing can follow it any more
+            changed = True
+    for old in reverted:
+        del moves[old]
+        changed = True
+    for old, new in resolved.items():
+        del moves[old]
+        patch = patches.get(old)
+        if isinstance(patch, dict) and new not in patches and new not in deleted_nodes:
+            del patches[old]
+            patches[new] = patch
+            _refresh_anchor(patch, present[new])
+        if old in deleted_nodes:
+            deleted_nodes.setdefault(new, deleted_nodes.pop(old))
+    for eid, rec in list(ov_edges.items()):
+        if not isinstance(rec, dict):
+            continue
+        ends = (str(rec.get("source")), str(rec.get("target")))
+        moved = (resolved.get(ends[0], ends[0]), resolved.get(ends[1], ends[1]))
+        if moved == ends:
+            continue
+        new_eid = edge_id(moved[0], moved[1], rec.get("relation"))
+        if new_eid in ov_edges:
+            continue  # the new ids have their own edge: this one stays out
+        del ov_edges[eid]
+        rec["source"], rec["target"] = moved
+        anchors = rec.get(EDGE_ANCHOR)
+        for side, old, new in zip(("source", "target"), ends, moved):
+            fresh = _node_anchor(present[new], patches.get(new)) if old != new else None
+            if fresh is not None and isinstance(anchors, dict):
+                anchors[side] = fresh
+        ov_edges[new_eid] = rec
+    if resolved and deleted_edges:
+        olds: dict[str, list[str]] = {}
+        for old, new in resolved.items():
+            olds.setdefault(new, []).append(old)
+        for link in links:
+            s, t = str(link.get("source")), str(link.get("target"))
+            if s not in olds and t not in olds:
+                continue
+            eid = edge_id(s, t, link.get("relation"))
+            for old_s in (s, *olds.get(s, ())):
+                for old_t in (t, *olds.get(t, ())):
+                    old_eid = edge_id(old_s, old_t, link.get("relation"))
+                    if old_eid != eid and old_eid in deleted_edges:
+                        deleted_edges.setdefault(eid, deleted_edges.pop(old_eid))
+    return [{"from": old, "to": new} for old, new in sorted(resolved.items())], changed or bool(resolved)
+
+
+# Keys of the ``apply_overlay`` result that do not count graph changes: the
+# records that stay out and the overlay bookkeeping.
 OVERLAY_SKIP_KEYS = frozenset(
     {
         "conflicts", "dangling", "stale_patches", "conflict_edges", "dangling_edges",
-        "stale_patch_nodes", "rekeyed_patches", "patches_anchored",
+        "stale_patch_nodes", "rekeyed_patches", "patches_anchored", "rekeyed_edges",
+        "edges_anchored", "applied_moves", "overlay_changed",
     }
 )
 
@@ -793,9 +1048,9 @@ class KnowledgeBase:
             self.overlay = self._read_overlay()
             stats = apply_overlay(self.data, self.overlay, links_key=self.links_key)
             self.overlay_stats = stats
-            if (stats["rekeyed_patches"] or stats["patches_anchored"]) and self.overlay_path.is_file():
-                # Keep the new patch ids and anchors, so the next load finds them
-                # at once.  The caller holds the store lock.
+            if stats["overlay_changed"] and self.overlay_path.is_file():
+                # Keep the new ids, anchors and applied moves, so the next load
+                # finds them at once.  The caller holds the store lock.
                 _dump_atomic(self.overlay_path, self.overlay)
                 sig["overlay"] = _file_stat(self.overlay_path)
             changed = any(v for k, v in stats.items() if k not in OVERLAY_SKIP_KEYS)
@@ -1014,12 +1269,16 @@ class KnowledgeBase:
         self._log(("put_node", before))
 
     def _p_put_edge(self, rec: dict[str, Any]) -> None:
+        if EDGE_ANCHOR in rec:
+            rec = {k: v for k, v in rec.items() if k != EDGE_ANCHOR}
         eid = edge_id(rec.get("source"), rec.get("target"), rec.get("relation"))
         existing = self._edges.get(eid)
         before = copy.deepcopy(existing[0]) if existing else None
         self._raw_put_edge(rec)
         self.overlay["deleted_edges"].pop(eid, None)
-        self.overlay["edges"][eid] = copy.deepcopy(rec)
+        stored = copy.deepcopy(rec)
+        _anchor_edge(stored, self._nodes, self.overlay["patches"])
+        self.overlay["edges"][eid] = stored
         self._log(("put_edge", before) if before is not None else ("drop_edge", eid))
 
     def _p_drop_edge(self, eid: str) -> None:
@@ -1042,6 +1301,29 @@ class KnowledgeBase:
         rec = self.overlay[key].pop(rid, None)
         if rec is not None:
             self._log(("restore_overlay", key, rid, copy.deepcopy(rec)))
+
+    def _p_put_overlay(self, key: str, rid: str, rec: Any) -> None:
+        """Set an overlay record that the graph does not hold, such as a node move."""
+        before = self.overlay[key].get(rid)
+        self.overlay[key][rid] = copy.deepcopy(rec)
+        if before is None:
+            self._log(("drop_overlay", key, rid))
+        else:
+            self._log(("restore_overlay", key, rid, copy.deepcopy(before)))
+
+    def _settle_moves(self) -> None:
+        """Apply the node moves whose old node the graph lost (``move_node``).
+
+        The graph in memory holds the overlay already, so the overlay applies
+        again in place and only the moved records change.  This runs after the
+        change, outside its undo log: the code moved, so an undo keeps the
+        records at their new ids.
+        """
+        moves = self.overlay["moved_nodes"]
+        if not any(old not in self._nodes and _move_target(old, moves, self._nodes) for old in moves):
+            return
+        self.overlay_stats = apply_overlay(self.data, self.overlay, links_key=self.links_key)
+        self._reindex()
 
     def _p_put_ontology(self, onto: Ontology) -> None:
         before = None if self.ontology_inferred else self.ontology.to_dict()
@@ -1200,7 +1482,11 @@ class KnowledgeBase:
         log: list[tuple],
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Write the overlay and one history entry.  The caller holds the store lock."""
+        """Apply due node moves, write the overlay and one history entry.
+
+        The caller holds the store lock.
+        """
+        self._settle_moves()
         _dump_atomic(self.overlay_path, self.overlay)
         seq = self._last_seq() + 1
         entry = {"seq": seq, "ts": now_iso(), "actor": actor or "api", "op": op, "summary": summary, "undo": log}
@@ -1803,6 +2089,42 @@ class KnowledgeBase:
             self._p_drop_node(str(nid))
             return {"deleted": str(nid), "edges_deleted": removed}
 
+    def move_node(self, old: str, new: str, *, actor: str | None = None) -> dict[str, Any]:
+        """Send the overlay records of code node ``old`` to its new id ``new``.
+
+        A rename or a file move gives a code node a new id.  Its changes, edges
+        and deletion then follow it (see ``_apply_moves``).  The result
+        ``status`` is one of these:
+
+        - ``pending``: the graph still has ``old``, so the records follow after
+          the next graphify rebuild.  An undo removes the move.
+        - ``moved``: the graph has the new code, so the records follow now.
+          The code moved, so an undo keeps them at the new id.
+        - ``skipped``: the graph has neither node and the overlay has no
+          records of ``old``.  Nothing changes.
+        """
+        old, new = str(old or ""), str(new or "")
+        if not old or not new:
+            raise KBError("a move needs from and to")
+        if old == new:
+            raise KBError("from and to are the same node")
+        with self._tx("move_node", f"Move node {old} to {new}", actor):
+            ov = self.overlay
+            for nid in (old, new):
+                if nid in ov["nodes"] or is_kb_record(self._nodes.get(nid)):
+                    raise KBError(f"node {nid} is a knowledge-base node: only code nodes move")
+            moves = ov["moved_nodes"]
+            if old in self._nodes or old in moves.values():
+                status = "pending"
+            elif _move_target(old, {**moves, old: new}, self._nodes) is not None:
+                status = "moved"
+            elif _has_records(old, ov["patches"], ov["deleted_nodes"], ov["edges"]):
+                status = "pending"
+            else:
+                return {"from": old, "to": new, "status": "skipped"}
+            self._p_put_overlay("moved_nodes", old, new)
+            return {"from": old, "to": new, "status": status}
+
     def add_edge(
         self,
         source: str,
@@ -1939,6 +2261,8 @@ class KnowledgeBase:
             return self.update_node(str(op.get("id")), op.get("attrs") or {}, actor=actor)
         if kind == "delete_node":
             return self.delete_node(str(op.get("id")), actor=actor)
+        if kind == "move_node":
+            return self.move_node(str(op.get("from") or ""), str(op.get("to") or ""), actor=actor)
         if kind == "add_edge":
             return self.add_edge(
                 str(op.get("source")),
@@ -2127,6 +2451,28 @@ class KnowledgeBase:
                 "message": f"Changes to node {moved['from']} moved to node {moved['to']}: same file, label and class, or a unique label and class.",
                 "node": moved["to"],
                 "from": moved["from"],
+            })
+        for moved in self.overlay_stats.get("rekeyed_edges") or ():
+            rec = self.overlay["edges"].get(moved["to"]) or {}
+            out.append({
+                "severity": "info", "code": "rekeyed_overlay_edge",
+                "message": f"Edge {moved['from']} moved to edge {moved['to']}: its end nodes have new ids with the same anchors.",
+                "edge": {"id": moved["to"], "source": rec.get("source"), "target": rec.get("target"), "relation": rec.get("relation")},
+                "from": moved["from"],
+            })
+        for moved in self.overlay_stats.get("applied_moves") or ():
+            out.append({
+                "severity": "info", "code": "moved_overlay_node",
+                "message": f"Records of node {moved['from']} moved to node {moved['to']}: the code moved the node.",
+                "node": moved["to"],
+                "from": moved["from"],
+            })
+        for old, new in sorted(self.overlay["moved_nodes"].items()):
+            out.append({
+                "severity": "info", "code": "pending_overlay_move",
+                "message": f"Records of node {old} move to node {new} when the graph has the new code.",
+                "node": old,
+                "to": new,
             })
         return out
 
