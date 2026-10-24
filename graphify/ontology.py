@@ -1155,7 +1155,10 @@ def validate_graph(
             kb_neighbours[s].add(t)
         if t in kb_ids:
             kb_neighbours[t].add(s)
-        findings.extend(_confidence_findings(link, where))
+        score = link.get("confidence_score")
+        # An EXTRACTED edge at 1.0 or without a score has nothing to report.
+        if link.get("confidence") != "EXTRACTED" or not (score is None or (type(score) is float and score == 1.0)):
+            findings.extend(_confidence_findings(link, where))
         if not rel:
             findings.append(_finding("error", "missing_relation", f"Edge {s} to {t} has no relation.", **where))
             continue

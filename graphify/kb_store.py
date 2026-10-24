@@ -44,6 +44,9 @@ SCHEMA_VERSION = 1
 _MISSING = object()
 _UPSERT = sqlite3.sqlite_version_info >= (3, 24, 0)
 _BATCH = 2048
+# A table with at most this many rows keeps its ids in memory, so a read of a
+# missing row needs no query.  Patches, deletions and moves are small tables.
+_KEY_CACHE = 65536
 # From this many overlay rows, the store trains its row dictionary and
 # compresses each row.  The dictionary never changes after that.
 ZDICT_ROWS = 1000
@@ -144,14 +147,46 @@ class OverlayTable(MutableMapping):
         self._table = f"ov_{kind}"
         self._dirty: dict[str, Any] = {}
         self._gone: set[str] = set()  # rows of the file that the pending change deletes
+        # The ids of the file rows when the table is small, else None (see ``_KEY_CACHE``).
+        self._keys: set[Any] | None = None
+        self._keys_read = False
 
     # -- pending writes --------------------------------------------------
     def pending(self) -> bool:
         return bool(self._dirty or self._gone)
 
     def discard(self) -> None:
+        """Drop the pending writes.  The file can have changed, so the id cache goes too."""
         self._dirty = {}
         self._gone = set()
+        self._forget_keys()
+
+    def _forget_keys(self) -> None:
+        self._keys = None
+        self._keys_read = False
+
+    def _committed(self) -> None:
+        """Clear the pending writes after their commit, and keep the id cache current."""
+        keys = self._keys
+        if keys is not None:
+            keys.difference_update(self._gone)
+            keys.update(self._dirty)
+            if len(keys) > _KEY_CACHE:
+                self._keys = None
+        self._dirty = {}
+        self._gone = set()
+
+    def _maybe_on_disk(self, key: Any) -> bool:
+        """Return False when the file surely has no row ``key``."""
+        if not self._keys_read:
+            self._keys_read = True
+            db = self._store.db()
+            small = db is not None and db.execute(
+                f"SELECT count(*) FROM (SELECT 1 FROM {self._table} LIMIT {_KEY_CACHE + 1})"
+            ).fetchone()[0] <= _KEY_CACHE
+            self._keys = {k for (k,) in self._rows("id")} if small else None
+        keys = self._keys
+        return keys is None or key in keys
 
     def _write(self, db: sqlite3.Connection) -> None:
         table = self._table
@@ -176,12 +211,16 @@ class OverlayTable(MutableMapping):
         db = self._store.db()
         if db is None:
             return None
+        if not self._maybe_on_disk(key):
+            return None
         row = db.execute(f"SELECT data FROM {self._table} WHERE id = ?", (key,)).fetchone()
         return None if row is None else row[0]
 
     def _on_disk(self, key: Any) -> bool:
         db = self._store.db()
         if db is None:
+            return False
+        if not self._maybe_on_disk(key):
             return False
         return db.execute(f"SELECT 1 FROM {self._table} WHERE id = ?", (key,)).fetchone() is not None
 
@@ -381,6 +420,9 @@ class Store:
             self._db.close()
             self._db = None
         self._zdict = None
+        # Another process can change the file before the next open.
+        for table in self.tables.values():
+            table._forget_keys()
 
     def __enter__(self) -> Store:
         return self
@@ -531,7 +573,8 @@ class Store:
             if trained:
                 self._zdict = None
             raise
-        self.discard()
+        for table in self.tables.values():
+            table._committed()
         return count
 
     @staticmethod
@@ -596,6 +639,8 @@ class Store:
             if trained:
                 self._zdict = None
             raise
+        for table in self.tables.values():
+            table._forget_keys()
         return count
 
     def add_history(self, entries: Iterable[dict[str, Any]]) -> int:

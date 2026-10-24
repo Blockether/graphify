@@ -1,5 +1,7 @@
 """Knowledge base edits, overlay, history, documents and ingest (graphify.kb)."""
+import copy
 import json
+import random
 
 import pytest
 
@@ -160,6 +162,81 @@ def test_search_class_filter_takes_subclasses(tmp_path):
         assert [hit["id"] for hit in kb.search("run", cls=cls)] == ["fn_run"]
     assert kb.search("run", cls="code.class") == []
     assert [hit["id"] for hit in kb.search("service", cls="code")] == ["cls_svc"]
+
+
+def test_search_after_writes_matches_a_new_build(tmp_path):
+    # The search text and the method edge sets outlive a version: each write notes what it changes.
+    kb = _method_kb(tmp_path)
+    rng = random.Random(3)
+    words = ["alpha", "beta", "pay", "payment run", "gateway"]
+    queries = ["a", "pay", "payment run", "run", "service", "kb:", "s.py", "gateway", "zz"]
+
+    def results():
+        return [kb.search(q) for q in queries] + [kb.search(q, cls="code.method") for q in ("run", "service")]
+
+    def check():
+        got = results()
+        index, kb._search_index, kb._method_rows = kb._search_index, None, None
+        want = results()
+        kb._search_index = index
+        assert got == want
+
+    kb.search("warm")
+    for step in range(80):
+        ids = [n["id"] for n in kb.data["nodes"] if str(n["id"]).startswith("kb:")]
+        op = rng.random()
+        if op < 0.35 or not ids:
+            kb.add_node(f"{rng.choice(words)} {step}", cls=rng.choice(["concept", "code"]))
+        elif op < 0.6:
+            kb.update_node(rng.choice(ids), {"label": f"{rng.choice(words)} {step}"})
+        elif op < 0.75:
+            kb.delete_node(rng.choice(ids))
+        elif op < 0.9:
+            # A method edge between two code nodes changes their classes.
+            try:
+                kb.delete_edge(edge_id("fn_run", "cls_svc", "method"))
+            except NotFound:
+                kb.add_edge("fn_run", "cls_svc", "method")
+        else:
+            kb.undo()
+        check()
+
+
+def test_search_reads_documents_again_after_a_document_change(kb):
+    doc = kb.create_document("Lease notes", body="How the lease works.")
+    assert [hit["id"] for hit in kb.search("lease works")] == [doc["id"]]
+    rows = kb._docs_rows
+    kb.add_node("Lease desk", cls="concept")
+    kb.search("lease")
+    assert kb._docs_rows is rows  # a node write keeps the document rows
+    kb.update_document(doc["id"], body="How the rent works.")
+    assert kb.search("lease works") == [] and [hit["id"] for hit in kb.search("rent works")] == [doc["id"]]
+    kb.delete_document(doc["id"])
+    assert kb.search("rent works") == []
+    kb.undo()
+    assert [hit["id"] for hit in kb.search("rent works")] == [doc["id"]]
+
+
+def test_document_rows_after_changes_match_a_new_read(kb):
+    # A document change reads only that document again, and the rows keep the order of list_documents.
+    rng = random.Random(5)
+    kb._documents_index()
+    for step in range(40):
+        for _ in range(rng.randint(1, 3)):
+            docs = [meta["id"] for meta in kb.list_documents()]
+            op = rng.random()
+            if op < 0.4 or not docs:
+                kb.create_document(f"Note {step % 7}", body=f"body {step}")
+            elif op < 0.7:
+                kb.update_document(rng.choice(docs), body=f"changed {step}")
+            elif op < 0.85:
+                kb.delete_document(rng.choice(docs))
+            else:
+                kb.undo()
+        got = kb._documents_index()
+        kb._docs_rows = None
+        assert got == kb._documents_index()
+        assert [row[1]["id"] for row in got] == [meta["id"] for meta in kb.list_documents()]
 
 
 def test_wiki_links_find_code_nodes_by_parent_class_and_by_id(tmp_path):
@@ -433,7 +510,7 @@ def test_kb_rekeys_a_patch_after_a_rename_and_keeps_it(tmp_path):
     found = [f for f in store.validate()["findings"] if f["code"] == "rekeyed_overlay_patch"]
     assert [(f["from"], f["node"], f["severity"]) for f in found] == [("a", "src_a", "info")]
     stored = read_overlay(graph.parent)
-    assert list(stored["patches"]) == ["src_a"]
+    assert stored is not None and list(stored["patches"]) == ["src_a"]
 
 
 def _rebuild(graph, base, changes):
@@ -470,7 +547,7 @@ def test_kb_edge_follows_a_file_rename(tmp_path):
     found = [f for f in store.validate()["findings"] if f["code"] in ("rekeyed_overlay_edge", "stale_overlay_edge")]
     assert [(f["code"], f["from"], f["edge"]["id"]) for f in found] == [("rekeyed_overlay_edge", old_eid, new_eid)]
     stored = read_overlay(graph.parent)
-    assert list(stored["edges"]) == [new_eid]
+    assert stored is not None and list(stored["edges"]) == [new_eid]
     assert stored["edges"][new_eid][EDGE_ANCHOR]["target"]["source_file"] == "src/a.py"
     store.flush()
     assert not any(EDGE_ANCHOR in x for x in json.loads(graph.read_text(encoding="utf-8"))["links"])
@@ -501,7 +578,7 @@ def test_move_node_waits_for_the_rebuild_and_moves_every_record(tmp_path):
     assert "moved_overlay_node" in codes and "pending_overlay_move" not in codes
     assert not {"stale_overlay_patch", "stale_overlay_edge"} & codes
     stored = read_overlay(graph.parent)
-    assert stored["moved_nodes"] == {} and list(stored["patches"]) == ["a_v2"]
+    assert stored is not None and stored["moved_nodes"] == {} and list(stored["patches"]) == ["a_v2"]
     assert stored["patches"]["a_v2"][PATCH_ANCHOR]["label"] == "AlphaV2"
     assert edge_id("r", "a_v2", "rationale_for") in stored["deleted_edges"]
 
@@ -1073,3 +1150,15 @@ def test_compact_graph_write_is_the_text_of_json_dumps(tmp_path):
     for value in (data, [1, {"a": "b"}], {1: "x", "k": [0] * (kb_module._JSON_SLICE + 1)}):
         kb_module._dump_atomic(out, value, compact=True)
         assert out.read_text(encoding="utf-8") == json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def test_clone_copies_json_values_like_deepcopy():
+    from graphify import kb as kb_module
+
+    value = {"a": [1, 2.5, None, True, {"b": "c"}], "d": {"e": [], "f": {}}, 3: ("t", [1])}
+    copied = kb_module._clone(value)
+    assert copied == copy.deepcopy(value)
+    copied["a"][4]["b"] = "x"
+    copied["d"]["e"].append(1)
+    copied[3][1].append(2)
+    assert value == {"a": [1, 2.5, None, True, {"b": "c"}], "d": {"e": [], "f": {}}, 3: ("t", [1])}

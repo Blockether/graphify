@@ -368,6 +368,10 @@ def test_infer_marks_contains_and_inherits_acyclic():
         ("AMBIGUOUS", 0.6, ("confidence_mismatch", "warning")),
         ("SURE", 1.0, ("invalid_confidence", "warning")),
         ("EXTRACTED", 1.5, ("invalid_confidence", "warning")),
+        # The validator skips the rubric for EXTRACTED at 1.0 or without a score.
+        ("EXTRACTED", None, None),
+        ("EXTRACTED", True, ("invalid_confidence", "warning")),
+        ("EXTRACTED", float("nan"), ("invalid_confidence", "warning")),
     ],
 )
 def test_confidence_score_follows_graphify_rubric(confidence, score, expected):

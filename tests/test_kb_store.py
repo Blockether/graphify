@@ -37,6 +37,38 @@ def test_overlay_table_keeps_order_and_pending_writes(tmp_path):
     assert read_store_overlay(tmp_path / "missing.sqlite") is None
 
 
+def test_a_small_table_answers_missing_ids_without_a_query(tmp_path):
+    path = tmp_path / STORE_FILE
+    store, other = Store(path), Store(path)
+    nodes = store.overlay()["nodes"]
+    nodes["a"] = {"id": "a"}
+    store.commit()
+    assert nodes.get("a") == {"id": "a"}
+    db = store.db()
+    assert db is not None
+    queries: list[str] = []
+    db.set_trace_callback(queries.append)
+    assert "b" not in nodes and nodes.get("b") is None
+    db.set_trace_callback(None)
+    assert queries == []
+    # The ids follow the commits of this store.
+    nodes["b"] = {"id": "b"}
+    del nodes["a"]
+    store.commit()
+    assert "a" not in nodes and nodes["b"] == {"id": "b"}
+    # The commit of another process shows after discard, as a KB reload does it.
+    other.overlay()["nodes"]["c"] = {"id": "c"}
+    other.commit()
+    store.discard()
+    assert nodes["c"] == {"id": "c"}
+    other.overlay()["nodes"]["d"] = {"id": "d"}
+    other.commit()
+    store.close()
+    assert nodes["d"] == {"id": "d"}
+    store.close()
+    other.close()
+
+
 def test_backup_copies_the_store(tmp_path):
     store = Store(tmp_path / STORE_FILE)
     store.overlay()["edges"]["e"] = {"source": "a", "target": "b", "relation": "calls"}

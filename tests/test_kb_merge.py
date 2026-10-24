@@ -247,6 +247,7 @@ def test_update_drops_a_kb_node_that_the_overlay_removed(tmp_path):
 
     # A written kb/overlay.json is an import: the store and the rebuild read it.
     overlay = read_overlay(graph_path.parent)
+    assert overlay is not None
     del overlay["nodes"][concept["id"]]
     (graph_path.parent / "kb" / "overlay.json").write_text(json.dumps(overlay), encoding="utf-8")
 

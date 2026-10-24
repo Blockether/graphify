@@ -27,6 +27,7 @@ from __future__ import annotations
 import base64
 import copy
 import errno
+import gc
 import hashlib
 import json
 import mimetypes
@@ -43,7 +44,7 @@ from bisect import bisect_right
 from collections import Counter
 from contextlib import contextmanager
 from itertools import accumulate
-from operator import methodcaller
+from operator import itemgetter, methodcaller
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Iterable, Iterator
 
@@ -180,6 +181,24 @@ def _file_lock(path: Path, timeout: float = LOCK_TIMEOUT) -> Iterator[None]:
                 msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
     finally:
         fh.close()
+
+
+@contextmanager
+def _gc_paused() -> Iterator[None]:
+    """Pause the cyclic garbage collector while one large report builds.
+
+    The findings of a report hold no reference cycles, so a collection in the
+    build frees nothing and only walks the same records again.  The collector
+    stays off when the caller turned it off.
+    """
+    if not gc.isenabled():
+        yield
+        return
+    gc.disable()
+    try:
+        yield
+    finally:
+        gc.enable()
 
 
 def _file_stat(path: Path) -> tuple[int, int, int] | None:
@@ -327,6 +346,26 @@ def _same(value: Any) -> Any:
     return value
 
 
+_ATOMS = frozenset({str, int, float, bool, type(None)})
+
+
+def _clone(value: Any) -> Any:
+    """Return a deep copy of a JSON value: new dicts and lists, the same leaves.
+
+    The records hold only JSON values, so this does the work of
+    ``copy.deepcopy`` in about a fifth of the time.  Other types go to
+    ``copy.deepcopy``.
+    """
+    kind = type(value)
+    if kind is dict:
+        return {k: v if type(v) in _ATOMS else _clone(v) for k, v in value.items()}
+    if kind is list:
+        return [v if type(v) in _ATOMS else _clone(v) for v in value]
+    if kind in _ATOMS:
+        return value
+    return copy.deepcopy(value)
+
+
 def _key_set(table: Any) -> Any:
     """Return the keys of ``table`` for many ``in`` tests.
 
@@ -356,6 +395,28 @@ def _scan(text: str, starts: array, query: str) -> dict[int, int]:
         found[i] = pos - starts[i]
         pos = text.find(query, starts[i + 1])
     return found
+
+
+def _document_row(name: str, meta: dict[str, Any], body: str) -> tuple[str, dict[str, Any], str, str, str]:
+    """Return the search row of one document for ``KnowledgeBase._documents_index``."""
+    return (name, meta, str(meta.get("title") or "").lower(), body, body.lower())
+
+
+def _match_node(node: dict[str, Any], q: str, terms: list[str]) -> tuple[Any, ...] | None:
+    """Return the match row of ``KnowledgeBase._node_matches`` for one node, or None.
+
+    It gives the same facts as ``_scan`` over the joined text of the node.
+    """
+    if "\x00" in q:
+        return None
+    label = str(node.get("label") or "").lower()
+    at = label.find(q)
+    every = len(terms) > 1 and all(term in label for term in terms)
+    in_id = q in str(node.get("id")).lower()
+    in_src = q in str(node.get("source_file") or "").lower()
+    if at < 0 and not (every or in_id or in_src):
+        return None
+    return (node, at if at >= 0 else None, every, in_id, in_src, at == 0 and len(label) == len(q))
 
 
 def apply_overlay(
@@ -399,7 +460,7 @@ def apply_overlay(
     again.  With ``copy_records=False`` the graph takes the overlay records
     without a deep copy; use it when each read returns a new copy.
     """
-    clone = copy.deepcopy if copy_records else _same
+    clone = _clone if copy_records else _same
     key = links_key or ("links" if "links" in data or "edges" not in data else "edges")
     if directed is None:
         directed = bool(data.get("directed", False))
@@ -1069,6 +1130,15 @@ class KnowledgeBase:
         self._dirty = False
         self._seen: dict[str, Any] = {}
         self._cache: dict[str, tuple[int, Any]] = {}
+        # The search rows of the documents (``_documents_index``).  A document
+        # change notes its id in ``_docs_touched``, and a load drops the rows.
+        self._docs_rows: list[tuple[str, dict[str, Any], str, str, str]] | None = None
+        self._docs_touched: set[str] = set()
+        # The search text of the nodes (``_text_index``) and the ``method`` edge
+        # sets also outlive a version: writes note what they change.
+        self._search_index: dict[str, Any] | None = None
+        self._method_gen = 0
+        self._method_rows: tuple[int, tuple[set[str] | None, set[str] | None]] | None = None
         self.version = 0
         self._store = Store(self.store_path)
         # The overlay tables and the history read the store on demand.
@@ -1235,6 +1305,9 @@ class KnowledgeBase:
         lock.  This only marks the graph dirty; callers flush it.
         """
         with self._lock:
+            self._docs_rows = None
+            self._method_gen += 1
+            self._search_index = None
             sig = self._signature()
             if self.graph_path.is_file():
                 try:
@@ -1348,6 +1421,8 @@ class KnowledgeBase:
     def _reindex(self) -> None:
         self._nodes: dict[str, dict[str, Any]] = {str(node.get("id")): node for node in self.data["nodes"]}
         self._edge_index = None
+        self._search_index = None
+        self._method_gen += 1
         outs: dict[str, list[dict[str, Any]]] = {}
         ins: dict[str, list[dict[str, Any]]] = {}
         for link in self.data[self.links_key]:
@@ -1497,6 +1572,8 @@ class KnowledgeBase:
         else:
             node.clear()
             node.update(rec)
+        if self._search_index is not None:
+            self._note_search(nid, rec if node is None else node, added=node is None)
 
     def _raw_drop_node(self, nid: str) -> None:
         node = self._nodes.pop(nid, None)
@@ -1504,6 +1581,8 @@ class KnowledgeBase:
             # The list keeps the node until ``_compact``: one pass for each
             # change, not one pass for each removed record.
             self._gone[id(node)] = node
+            if self._search_index is not None:
+                self._note_search(nid, node, added=False)
         self._out.pop(nid, None)
         self._in.pop(nid, None)
 
@@ -1516,6 +1595,8 @@ class KnowledgeBase:
         gone = self._gone
         if not gone:
             return
+        if any(x.get("relation") == "method" for x in gone.values()):
+            self._method_gen += 1
         for key in ("nodes", self.links_key):
             items = self.data.get(key)
             if isinstance(items, list):
@@ -1525,6 +1606,8 @@ class KnowledgeBase:
     def _raw_put_edge(self, rec: dict[str, Any]) -> None:
         eid = edge_id(rec.get("source"), rec.get("target"), rec.get("relation"))
         existing = self._edges.get(eid)
+        if rec.get("relation") == "method" or (existing and existing[0].get("relation") == "method"):
+            self._method_gen += 1
         if existing:
             existing[0].clear()
             existing[0].update(rec)
@@ -1554,12 +1637,12 @@ class KnowledgeBase:
 
     def _p_put_node(self, rec: dict[str, Any]) -> None:
         nid = str(rec["id"])
-        before = copy.deepcopy(self._nodes.get(nid))
+        before = _clone(self._nodes.get(nid))
         self._raw_put_node(rec)
         ov = self.overlay
         ov["deleted_nodes"].pop(nid, None)
         if rec.get("_origin") == KB_ORIGIN:
-            ov["nodes"][nid] = copy.deepcopy(rec)
+            ov["nodes"][nid] = _clone(rec)
             ov["patches"].pop(nid, None)
         else:
             ov["nodes"].pop(nid, None)
@@ -1571,7 +1654,7 @@ class KnowledgeBase:
                     continue
                 new = rec.get(key, _MISSING)
                 if base.get(key, _MISSING) != new:
-                    patch[key] = None if new is _MISSING else copy.deepcopy(new)
+                    patch[key] = None if new is _MISSING else _clone(new)
             if not any(key != PATCH_ANCHOR for key in patch):
                 ov["patches"].pop(nid, None)
             elif fresh and before is not None:
@@ -1580,7 +1663,7 @@ class KnowledgeBase:
         self._log(("put_node", before) if before is not None else ("drop_node", nid))
 
     def _p_drop_node(self, nid: str) -> None:
-        before = copy.deepcopy(self._nodes.get(nid))
+        before = _clone(self._nodes.get(nid))
         if before is None:
             return
         self._raw_drop_node(nid)
@@ -1596,10 +1679,10 @@ class KnowledgeBase:
             rec = {k: v for k, v in rec.items() if k != EDGE_ANCHOR}
         eid = edge_id(rec.get("source"), rec.get("target"), rec.get("relation"))
         existing = self._edges.get(eid)
-        before = copy.deepcopy(existing[0]) if existing else None
+        before = _clone(existing[0]) if existing else None
         self._raw_put_edge(rec)
         self.overlay["deleted_edges"].pop(eid, None)
-        stored = copy.deepcopy(rec)
+        stored = _clone(rec)
         _anchor_edge(stored, self._nodes, self.overlay["patches"])
         self.overlay["edges"][eid] = stored
         self._log(("put_edge", before) if before is not None else ("drop_edge", eid))
@@ -1617,22 +1700,22 @@ class KnowledgeBase:
         if any(link.get("_origin") != KB_ORIGIN for link in records):
             self.overlay["deleted_edges"][eid] = now_iso()
         for link in reversed(records):
-            self._log(("put_edge", copy.deepcopy(link)))
+            self._log(("put_edge", _clone(link)))
 
     def _p_drop_overlay(self, key: str, rid: str) -> None:
         """Remove an overlay record that the graph does not hold (R6)."""
         rec = self.overlay[key].pop(rid, None)
         if rec is not None:
-            self._log(("restore_overlay", key, rid, copy.deepcopy(rec)))
+            self._log(("restore_overlay", key, rid, _clone(rec)))
 
     def _p_put_overlay(self, key: str, rid: str, rec: Any) -> None:
         """Set an overlay record that the graph does not hold, such as a node move."""
         before = self.overlay[key].get(rid)
-        self.overlay[key][rid] = copy.deepcopy(rec)
+        self.overlay[key][rid] = _clone(rec)
         if before is None:
             self._log(("drop_overlay", key, rid))
         else:
-            self._log(("restore_overlay", key, rid, copy.deepcopy(before)))
+            self._log(("restore_overlay", key, rid, _clone(before)))
 
     def _settle_moves(self) -> None:
         """Apply the node moves whose old node the graph lost (``move_node``).
@@ -1653,6 +1736,7 @@ class KnowledgeBase:
     def _p_put_ontology(self, onto: Ontology) -> None:
         before = None if self.ontology_inferred else self.ontology.to_dict()
         self.ontology = onto
+        self._method_gen += 1
         self.ontology_inferred = False
         save_ontology(onto, self.onto_path)
         self._log(("put_ontology", before))
@@ -1666,6 +1750,7 @@ class KnowledgeBase:
         _dump_atomic(folder / "meta.json", meta)
         if body is not None:
             _write_text_atomic(folder / "body.md", body)
+        self._docs_touched.add(doc_id)
         if before_meta is None:
             self._log(("drop_doc", doc_id))
         else:
@@ -1677,6 +1762,7 @@ class KnowledgeBase:
             return
         dest = self._trash_slot(f"doc-{doc_id}")
         shutil.move(str(folder), str(dest))
+        self._docs_touched.add(doc_id)
         self._log(("restore_doc", doc_id, str(dest)))
 
     def _p_put_asset(self, doc_id: str, name: str, data: bytes) -> None:
@@ -1706,11 +1792,11 @@ class KnowledgeBase:
     def _run_inverse(self, step: tuple) -> None:
         kind = step[0]
         if kind == "put_node":
-            self._p_put_node(copy.deepcopy(step[1]))
+            self._p_put_node(_clone(step[1]))
         elif kind == "drop_node":
             self._p_drop_node(step[1])
         elif kind == "put_edge":
-            self._p_put_edge(copy.deepcopy(step[1]))
+            self._p_put_edge(_clone(step[1]))
         elif kind == "drop_edge":
             self._p_drop_edge(step[1])
         elif kind == "put_ontology":
@@ -1721,6 +1807,7 @@ class KnowledgeBase:
                 except FileNotFoundError:
                     pass
                 self.ontology = self._default_ontology()
+                self._method_gen += 1
                 self.ontology_inferred = True
                 self._log(("put_ontology", before))
             else:
@@ -1734,6 +1821,7 @@ class KnowledgeBase:
             if folder.exists():
                 self._p_drop_doc(step[1])
             shutil.move(step[2], str(folder))
+            self._docs_touched.add(step[1])
             self._log(("drop_doc", step[1]))
         elif kind == "drop_asset":
             self._p_drop_asset(step[1], step[2])
@@ -1745,7 +1833,7 @@ class KnowledgeBase:
             shutil.move(step[3], str(path))
             self._log(("drop_asset", step[1], step[2]))
         elif kind == "restore_overlay":
-            self.overlay[step[1]][step[2]] = copy.deepcopy(step[3])
+            self.overlay[step[1]][step[2]] = _clone(step[3])
             self._log(("drop_overlay", step[1], step[2]))
         elif kind == "drop_overlay":
             self._p_drop_overlay(step[1], step[2])
@@ -1990,15 +2078,22 @@ class KnowledgeBase:
         """Return the class of ``node``, as ``validate_graph`` finds it (S5).
 
         Methods and their owners are known by their ``method`` edges, so the
-        two edge sets come from the graph once per version.
+        two edge sets come from the graph again only after a change of them.
         """
-        targets, owners = self._cached("method_sets", self._method_sets)
+        targets, owners = self._method_index()
         return self.ontology.node_class(node, method_targets=targets, method_owners=owners) or "unclassified"
 
     def _method_sets(self) -> tuple[set[str] | None, set[str] | None]:
         if self.ontology.class_key != "file_type":
             return None, None
         return method_targets(self.data), method_owners(self.data)
+
+    def _method_index(self) -> tuple[set[str] | None, set[str] | None]:
+        """Return ``_method_sets``, built again after a ``method`` edge, a load or an ontology change."""
+        rows = self._method_rows
+        if rows is None or rows[0] != self._method_gen:
+            rows = self._method_rows = (self._method_gen, self._method_sets())
+        return rows[1]
 
     def _check_class(self, cls: Any) -> str:
         """Return a valid class name for a node write (bug 18).
@@ -2040,7 +2135,7 @@ class KnowledgeBase:
     def _build_stats(self) -> dict[str, Any]:
         with self._lock:
             # ``node_class`` without its method lookup and cache read for each node.
-            targets, owners = self._cached("method_sets", self._method_sets)
+            targets, owners = self._method_index()
             node_class = self.ontology.node_class
             classes: dict[str, int] = {}
             for node in self.data["nodes"]:
@@ -2186,7 +2281,7 @@ class KnowledgeBase:
             out = self._out.get(str(nid), [])
             inc = self._in.get(str(nid), [])
             return {
-                "node": copy.deepcopy(node),
+                "node": _clone(node),
                 "class": self.node_class(node),
                 "kb": node.get("_origin") == KB_ORIGIN,
                 "out": [self._edge_view(x, str(x.get("target"))) for x in out[:limit]],
@@ -2201,7 +2296,7 @@ class KnowledgeBase:
             records = self._edges.get(eid)
             if not records:
                 raise NotFound(f"edge {eid} does not exist")
-            rec = copy.deepcopy(records[0])
+            rec = _clone(records[0])
             rec["id"] = eid
             return rec
 
@@ -2252,35 +2347,23 @@ class KnowledgeBase:
         hits: list[tuple[float, dict[str, Any]]] = []
         by_id: dict[str, tuple[float, dict[str, Any]]] = {}
         with self._lock:
-            index = self._cached("search_text", self._search_text)
-            nodes, (labels, starts) = index["nodes"], index["label"]
-            in_label = _scan(labels, starts, q)
-            every: set[int] = set()
-            if len(terms) > 1:
-                every = set(_scan(labels, starts, terms[0]))
-                for term in terms[1:]:
-                    every &= _scan(labels, starts, term).keys()
-            (ids, id_starts), (srcs, src_starts) = index["id"], index["src"]
-            in_id, in_src = _scan(ids, id_starts, q), _scan(srcs, src_starts, q)
-            for i in sorted(in_label.keys() | every | in_id.keys() | in_src.keys()):
-                node = nodes[i]
+            for node, at, every, in_id, in_src, whole in self._node_matches(q, terms):
                 node_cls = self.node_class(node)
                 # A class filter also takes the subclasses (RDFS rule rdfs9): code finds code.function.
                 if cls and not self.ontology.is_a(node_cls, cls):
                     continue
                 score = 0.0
-                at = in_label.get(i)
-                if at == 0 and starts[i + 1] - starts[i] - 1 == len(q):
+                if whole:
                     score += 100
                 elif at == 0:
                     score += 60
                 elif at is not None:
                     score += 35
-                elif i in every:
+                elif every:
                     score += 25
-                if i in in_id:
+                if in_id:
                     score += 8
-                if i in in_src:
+                if in_src:
                     score += 4
                 if score:
                     score += min(len(self._out.get(str(node.get("id")), ())), 40) / 40
@@ -2293,7 +2376,7 @@ class KnowledgeBase:
                         "score": round(score, 2),
                     })
             if not cls or cls == "document":
-                for meta, title, body, low in self._cached("search_documents", self._search_documents):
+                for _name, meta, title, body, low in self._documents_index():
                     score = 0.0
                     if q in title:
                         score += 50
@@ -2321,23 +2404,102 @@ class KnowledgeBase:
         hits.sort(key=lambda h: -h[0])
         return [h[1] for h in hits[: max(1, int(limit))]]
 
-    def _search_text(self) -> dict[str, Any]:
-        """Return the lowercase labels, ids and source files of the nodes, built once for each version."""
-        nodes = list(self.data["nodes"])
-        return {
-            "nodes": nodes,
-            "label": _joined([str(n.get("label") or "").lower() for n in nodes]),
-            "id": _joined([str(n.get("id")).lower() for n in nodes]),
-            "src": _joined([str(n.get("source_file") or "").lower() for n in nodes]),
-        }
+    def _text_index(self) -> dict[str, Any]:
+        """Return the search text of the nodes: their lowercase labels, ids and source files.
 
-    def _search_documents(self) -> list[tuple[dict[str, Any], str, str, str]]:
-        """Return each document with its lowercase title, its body and its lowercase body, read once for each version."""
-        out = []
-        for meta in self.list_documents():
-            body = self._read_body(meta["id"])
-            out.append((meta, str(meta.get("title") or "").lower(), body, body.lower()))
-        return out
+        After the build, ``_raw_put_node`` and ``_raw_drop_node`` note each
+        changed node in ``changed`` (by object) and each new node in ``added``.
+        A load, a move or many changes start a new build.
+        """
+        index = self._search_index
+        if index is None:
+            nodes = list(self.data["nodes"])
+            index = self._search_index = {
+                "nodes": nodes,
+                "label": _joined([str(n.get("label") or "").lower() for n in nodes]),
+                "id": _joined([str(n.get("id")).lower() for n in nodes]),
+                "src": _joined([str(n.get("source_file") or "").lower() for n in nodes]),
+                "pos": None,
+                "changed": {},
+                "added": [],
+                "limit": 1024 + len(nodes) // 32,
+            }
+        return index
+
+    def _note_search(self, nid: str, node: dict[str, Any], *, added: bool) -> None:
+        """Note a changed node for ``_text_index``.  After many changes, drop the text."""
+        index = self._search_index
+        if index is None:
+            return
+        if added:
+            index["added"].append((nid, node))
+        else:
+            index["changed"][id(node)] = node
+        if len(index["changed"]) + len(index["added"]) > index["limit"]:
+            self._search_index = None
+
+    def _node_matches(self, q: str, terms: list[str]) -> list[tuple[Any, ...]]:
+        """Return the nodes that match ``q``, in graph order, with their match facts.
+
+        Each row is ``(node, label position, every term, in id, in source
+        file, whole label)``.  The text of ``_text_index`` answers for the
+        nodes of its build.  The nodes that changed after it get a check of
+        their own text, at their place in the graph order.
+        """
+        index = self._text_index()
+        nodes, (labels, starts) = index["nodes"], index["label"]
+        in_label = _scan(labels, starts, q)
+        every: set[int] = set()
+        if len(terms) > 1:
+            every = set(_scan(labels, starts, terms[0]))
+            for term in terms[1:]:
+                every &= _scan(labels, starts, term).keys()
+        (ids, id_starts), (srcs, src_starts) = index["id"], index["src"]
+        in_id, in_src = _scan(ids, id_starts, q), _scan(srcs, src_starts, q)
+        changed, added = index["changed"], index["added"]
+        rows: list[tuple[int, tuple[Any, ...]]] = []
+        for i in in_label.keys() | every | in_id.keys() | in_src.keys():
+            if changed and id(nodes[i]) in changed:
+                continue
+            at = in_label.get(i)
+            whole = at == 0 and starts[i + 1] - starts[i] - 1 == len(q)
+            rows.append((i, (nodes[i], at, i in every, i in in_id, i in in_src, whole)))
+        if changed or added:
+            live = self._nodes
+            pos = index["pos"]
+            if pos is None:
+                pos = index["pos"] = {id(n): i for i, n in enumerate(nodes)}
+            fresh = [(pos[k], n) for k, n in changed.items() if k in pos and live.get(str(n.get("id"))) is n]
+            fresh += [(len(nodes) + k, n) for k, (nid, n) in enumerate(added) if live.get(nid) is n]
+            for i, node in fresh:
+                row = _match_node(node, q, terms)
+                if row is not None:
+                    rows.append((i, row))
+        rows.sort(key=itemgetter(0))
+        return [row for _, row in rows]
+
+    def _documents_index(self) -> list[tuple[str, dict[str, Any], str, str, str]]:
+        """Return the search rows of the documents, in the order of ``list_documents``.
+
+        A row holds the folder name, the meta, the lowercase title, the body and
+        the lowercase body.  After a document change, only the documents in
+        ``_docs_touched`` are read again.
+        """
+        rows, touched = self._docs_rows, self._docs_touched
+        if rows is None or len(touched) > 64 + len(rows) // 8:
+            rows = [_document_row(name, meta, self._read_body(meta["id"])) for name, meta in self._document_metas()]
+        elif touched:
+            rows = [row for row in rows if row[0] not in touched]
+            for name in touched:
+                folder = self.docs_dir / name
+                meta = self._read_meta(name) if folder.is_dir() and not name.startswith(".") else None
+                if meta:
+                    meta["review"] = len(meta.get("possible") or [])
+                    rows.append(_document_row(name, meta, self._read_body(meta["id"])))
+            rows.sort(key=itemgetter(0))
+            rows.sort(key=lambda row: str(row[1].get("updated_at") or ""), reverse=True)
+        self._docs_rows, self._docs_touched = rows, set()
+        return rows
 
     # -- node and edge writes -------------------------------------------
     def _new_node_id(self, label: str) -> str:
@@ -2390,7 +2552,7 @@ class KnowledgeBase:
                 # S4: a document node is a page, as in graphify's markdown extraction.
                 rec.setdefault("node_kind", "page")
             self._p_put_node(rec)
-            return copy.deepcopy(rec)
+            return _clone(rec)
 
     def update_node(self, nid: str, attrs: dict[str, Any], *, actor: str | None = None) -> dict[str, Any]:
         """Set attributes on a node.  A ``None`` value removes the attribute."""
@@ -2401,7 +2563,7 @@ class KnowledgeBase:
             node = self._nodes.get(str(nid))
             if node is None:
                 raise NotFound(f"node {nid} does not exist")
-            rec = copy.deepcopy(node)
+            rec = _clone(node)
             for key, value in changes.items():
                 if value is None:
                     if key in ("label", "file_type", "source_file"):
@@ -2425,7 +2587,7 @@ class KnowledgeBase:
                     meta["title"] = rec["label"]
                     meta["updated_at"] = rec["updated_at"]
                     self._p_put_doc(rec["doc_id"], meta, None)
-            return copy.deepcopy(rec)
+            return _clone(rec)
 
     def delete_node(self, nid: str, *, actor: str | None = None) -> dict[str, Any]:
         """Delete a node with its edges.  A document node deletes its document."""
@@ -2517,7 +2679,7 @@ class KnowledgeBase:
                         "delete that edge."
                     )
             if existing:
-                rec = copy.deepcopy(existing[0])
+                rec = _clone(existing[0])
                 rec.update({k: v for k, v in extra.items() if v is not None})
                 rec["confidence"] = conf
                 created = False
@@ -2542,7 +2704,7 @@ class KnowledgeBase:
                 created = True
             _check_edge_provenance(rec)
             self._p_put_edge(rec)
-            out = copy.deepcopy(rec)
+            out = _clone(rec)
             out["id"] = eid
             out["created"] = created
             return out
@@ -2556,7 +2718,7 @@ class KnowledgeBase:
             records = self._edges.get(eid)
             if not records:
                 raise NotFound(f"edge {eid} does not exist")
-            rec = copy.deepcopy(records[0])
+            rec = _clone(records[0])
             for key, value in changes.items():
                 if value is None:
                     rec.pop(key, None)
@@ -2566,7 +2728,7 @@ class KnowledgeBase:
                 raise KBError(f"confidence must be one of {sorted(VALID_CONFIDENCES)}")
             _check_edge_provenance(rec)
             self._p_put_edge(rec)
-            out = copy.deepcopy(rec)
+            out = _clone(rec)
             out["id"] = eid
             return out
 
@@ -2757,17 +2919,21 @@ class KnowledgeBase:
                 "by_code": dict(by_code.most_common()),
                 "nodes": full["nodes"],
                 "edges": full["edges"],
-                "findings": copy.deepcopy(findings[:limit]),
+                "findings": _clone(findings[:limit]),
                 "truncated": len(findings) > limit,
                 "total": len(findings),
                 "version": self.version,
             }
 
     def _full_report(self) -> dict[str, Any]:
-        report = validate_graph(self.data, self.ontology, limit=sys.maxsize, include_info=True)
-        findings = report["findings"] + self._overlay_findings()
-        rank = {s: i for i, s in enumerate(SEVERITIES)}
-        findings.sort(key=lambda f: (rank.get(f["severity"], 9), f["code"]))
+        with _gc_paused():
+            report = validate_graph(self.data, self.ontology, limit=sys.maxsize, include_info=True)
+            findings, extra = report["findings"], self._overlay_findings()
+        if extra:
+            # validate_graph sorts its own findings, so only the overlay findings need a new sort.
+            findings += extra
+            rank = {s: i for i, s in enumerate(SEVERITIES)}
+            findings.sort(key=lambda f: (rank.get(f["severity"], 9), f["code"]))
         return {"findings": findings, "nodes": report["nodes"], "edges": report["edges"]}
 
     def _overlay_findings(self) -> list[dict[str, Any]]:
@@ -2917,32 +3083,43 @@ class KnowledgeBase:
 
     def _read_meta(self, doc_id: str) -> dict[str, Any] | None:
         path = self._doc_dir(doc_id) / "meta.json"
-        if not path.is_file():
+        try:
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError:
             return None
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            return json.loads(text)
+        except json.JSONDecodeError:
             return None
 
     def _read_body(self, doc_id: str) -> str:
         path = self._doc_dir(doc_id) / "body.md"
         try:
-            return path.read_text(encoding="utf-8")
+            with open(path, encoding="utf-8") as fh:
+                return fh.read()
         except OSError:
             return ""
 
     def list_documents(self) -> list[dict[str, Any]]:
-        if not self.docs_dir.is_dir():
+        return [meta for _name, meta in self._document_metas()]
+
+    def _document_metas(self) -> list[tuple[str, dict[str, Any]]]:
+        """Return the folder name and the meta of each document, the latest change first."""
+        try:
+            entries = os.scandir(self.docs_dir)
+        except OSError:
             return []
+        with entries:
+            names = sorted(e.name for e in entries if not e.name.startswith(".") and e.is_dir())
         out = []
-        for folder in sorted(self.docs_dir.iterdir()):
-            if folder.is_dir() and not folder.name.startswith("."):
-                meta = self._read_meta(folder.name)
-                if meta:
-                    # D3: the number of open review items, for the document list.
-                    meta["review"] = len(meta.get("possible") or [])
-                    out.append(meta)
-        out.sort(key=lambda m: str(m.get("updated_at") or ""), reverse=True)
+        for name in names:
+            meta = self._read_meta(name)
+            if meta:
+                # D3: the number of open review items, for the document list.
+                meta["review"] = len(meta.get("possible") or [])
+                out.append((name, meta))
+        out.sort(key=lambda item: str(item[1].get("updated_at") or ""), reverse=True)
         return out
 
     def get_document(self, doc_id: str) -> dict[str, Any]:
@@ -2996,6 +3173,7 @@ class KnowledgeBase:
                 continue  # not a document folder
             if meta and move_document_ids(meta, moved, self._nodes):
                 _dump_atomic(folder / "meta.json", meta)
+                self._docs_touched.add(folder.name)
 
     def _link_index(self) -> LinkIndex:
         """Return the entity-linking index of the graph, rebuilt once per version."""
@@ -3199,7 +3377,7 @@ class KnowledgeBase:
         nid = meta["node_id"]
         node = self._nodes.get(nid)
         stamp = meta.get("updated_at") or now_iso()
-        rec = copy.deepcopy(node) if node else {
+        rec = _clone(node) if node else {
             "id": nid,
             "file_type": "document",
             "_origin": KB_ORIGIN,
