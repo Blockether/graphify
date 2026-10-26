@@ -381,6 +381,29 @@ if not plan.conflicts:
 
 `plan_rename` writes nothing. Its conflicts name an invalid name, a file that already uses the new name, an override or trait method, or unconfirmed calls of a common method name. Then run `graphify update .` to update the graph.
 
+## CRAP scores (Blockether fork)
+
+Use `graphify crap` to find the Clojure and Python functions that are complex and have few tests. The score is `CC² × (1 − coverage)³ + CC`, where CC is the cyclomatic complexity. A fully tested function scores its complexity; an untested one scores more. A score above 10 needs tests or a smaller function.
+
+```bash
+graphify crap                       # the whole project, coverage reports found under the root
+graphify crap src/app --changed     # only functions changed since HEAD
+graphify crap --threshold 8 --json  # exit 2 when a function scores above 8
+```
+
+- Coverage comes from Clofidence JSON (`target/coverage/clofidence.json`), coverage.py JSON (`coverage.json`) or LCOV. A Clojure namespace that the run measured but never loaded counts as 0 %. A function without coverage data has no CRAP score; the threshold then applies to its complexity.
+- Clojure complexity comes from the syntax tree. Quoted forms, `(comment ...)`, `:else` and the other platform's reader-conditional branches do not count.
+- Results stay in a cache per file. A second run on a large project takes milliseconds.
+- `--edn FILE` writes a crap4clj-style snapshot. Exit codes: 0 under the threshold, 2 over it, 1 on an error.
+
+```python
+from graphify.crap import analyze
+
+report = analyze(".", threshold=10)
+for entry in report.over:
+    print(entry.path, entry.name, entry.complexity, entry.coverage, entry.crap)
+```
+
 ---
 
 ## What files it handles: ~40 languages
