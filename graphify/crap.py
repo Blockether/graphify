@@ -4,9 +4,10 @@
 McCabe cyclomatic complexity of one function, counted on its tree-sitter syntax
 tree. ``coverage`` comes from a report that a test run already wrote:
 
-- Clojure: the Clofidence form report of ``clj.coverage``
+- Clojure: the Clofidence form report of ``clj.run_tests(coverage=True)``
   (``target/coverage/clofidence.json``, format ``vis-coverage/1``).
-- Python: coverage.py JSON (``coverage json``) or LCOV (``coverage lcov``).
+- Python: coverage.py JSON (``coverage json``, as ``py.run_tests(coverage=True)``
+  writes it) or LCOV (``coverage lcov``).
 
 Speed: tree-sitter queries find the units and the decision points in C, so Python
 only touches the matches. A cache keyed on file size, mtime and content skips every
