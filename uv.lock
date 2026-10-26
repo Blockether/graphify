@@ -1105,7 +1105,7 @@ wheels = [
 
 [[package]]
 name = "graphifyy"
-version = "0.9.93+blockether.19"
+version = "0.9.93+blockether.20"
 source = { editable = "." }
 dependencies = [
     { name = "networkx", version = "3.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
