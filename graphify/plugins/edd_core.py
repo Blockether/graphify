@@ -18,6 +18,7 @@ query map in the code against the full ``:consumes`` schema of its target.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -90,6 +91,10 @@ class EddCorePlugin(DomainPlugin):
         EFFECT: KindSpec("Effect", "Effects", "subroutine"),
         FUNCTION: KindSpec("Code caller", "Code callers", "rect", entry=True),
     }
+
+    # A file that requires edd.core names its first segment as a symbol, also in
+    # a prefix list such as [edd [core :as e]]. Words like "added" do not match.
+    markers = (rb"(?<![\w.*+!?<>=/:-])" + re.escape(EDD.split(".", 1)[0].encode()) + rb"(?![\w*+!?<>=/'-])",)
 
     def __init__(self, include_tests: bool = False):
         self.include_tests = include_tests

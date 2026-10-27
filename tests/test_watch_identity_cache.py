@@ -57,3 +57,24 @@ def test_cached_answers_match_a_fresh_computation(tmp_path):
             assert paths.in_watch_root(f) is expected
     assert paths.in_watch_root("src/a.py") is True
     assert paths.in_watch_root(outside) is False
+
+
+def test_rebase_preserved_is_computed_once_and_matches_a_fresh_computation(tmp_path):
+    paths = _paths(tmp_path)
+    outside = (tmp_path.parent / "elsewhere" / "x.py").as_posix()
+    cases = ["src/a.py", "./src/../src/a.py", "lib\\c.py", str(tmp_path / "src" / "d.py"), outside, "", None]
+    for f in cases:
+        expected = paths._rebased_uncached(f)
+        for _ in range(2):  # first call fills the cache, second reads it
+            item = {"source_file": f}
+            paths.rebase_preserved(item)
+            assert item["source_file"] == (f if expected is None else expected)
+    calls: list[str | None] = []
+    original = paths._rebased_uncached
+    paths._rebased_uncached = lambda f: calls.append(f) or original(f)
+    for _ in range(20):
+        paths.rebase_preserved({"source_file": "src/a.py"})
+    assert calls == []
+    item = {"source_file": str(tmp_path / "src" / "d.py")}
+    paths.rebase_preserved(item)
+    assert item["source_file"] == "src/d.py"

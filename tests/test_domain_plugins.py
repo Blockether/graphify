@@ -138,3 +138,44 @@ def test_bad_specs_fail_clearly(tmp_path):
     monkey_env = {plugin_mod.ENV_VAR: str(tmp_path / "empty.py")}
     discover(tmp_path, env=monkey_env, errors=errors)
     assert errors and "define `plugin`" in errors[0]
+
+
+def test_marked_plugins_skip_parsing_a_corpus_without_their_marker(tmp_path, monkeypatch):
+    """A plugin with markers costs no parse on a project that it cannot match."""
+    import graphify.domain as domain_mod
+
+    src = tmp_path / "src" / "app"
+    src.mkdir(parents=True)
+    (src / "core.clj").write_text("(ns app.core)\n\n(defn added [] :embedded-edd)\n")
+    parsed: list[Path] = []
+    real_read = domain_mod.read_file
+    monkeypatch.setattr(domain_mod, "read_file", lambda p, root: parsed.append(p) or real_read(p, root))
+    res = analyze(tmp_path)
+    assert res.empty and parsed == []
+    (src / "cmd.clj").write_text("(ns app.cmd\n  (:require [edd [core :as edd]]))\n")
+    res = analyze(tmp_path)
+    assert sorted(p.name for p in parsed) == ["cmd.clj", "core.clj"]
+    assert [p.name for p in res.plugins] == ["edd-core"]
+
+
+def test_a_discovered_plugin_without_markers_still_sees_the_parsed_corpus(tmp_path):
+    plugins = tmp_path / ".graphify" / "plugins"
+    plugins.mkdir(parents=True)
+    (plugins / "always.py").write_text(textwrap.dedent('''
+        from graphify.domain.plugin import DomainPlugin
+
+
+        class Always(DomainPlugin):
+            name = "always"
+
+            def detect(self, corpus):
+                return any(sf.ns == "a" for sf in corpus.files)
+
+            def extract(self, corpus, model):
+                pass
+
+
+        plugin = Always
+    '''))
+    (tmp_path / "a.clj").write_text("(ns a)\n")
+    assert [p.name for p in analyze(tmp_path).plugins] == ["always"]

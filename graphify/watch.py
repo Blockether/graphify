@@ -527,6 +527,8 @@ class _StoredSourcePaths:
         self.existing_source_root = project_root
         self._identity_cache: dict[str, str | None] = {}
         self._in_watch_root_cache: dict[str, bool] = {}
+        self._rebase_cache: dict[str, str | None] = {}
+        self._normalize_cache: dict[str, str | None] = {}
         relative_marker_prefix: str | None = None
 
         root_marker = out / ".graphify_root"
@@ -613,8 +615,14 @@ class _StoredSourcePaths:
         return checked == 0
 
     def normalize(self, source_file: str | None) -> str | None:
+        # Called for every node more than once per reconcile; cached per file like identity().
+        if isinstance(source_file, str) and source_file in self._normalize_cache:
+            return self._normalize_cache[source_file]
         normalized = self._normalize_source(source_file, str(self.project_root))
-        return posixpath.normpath(normalized) if normalized else normalized
+        normalized = posixpath.normpath(normalized) if normalized else normalized
+        if isinstance(source_file, str):
+            self._normalize_cache[source_file] = normalized
+        return normalized
 
     def absolute_identity(self, source_file: str | None, root: Path) -> str | None:
         normalized = self._normalize_source(source_file)
@@ -658,19 +666,32 @@ class _StoredSourcePaths:
         return self.identity(item.get("source_file")) in identities
 
     def rebase_preserved(self, item: dict) -> None:
-        identity = self.identity(item.get("source_file"))
+        # Reconcile rebases every preserved node, edge and hyperedge: ~185k items
+        # but ~2k distinct files on a mid-size repo, and each uncached call builds
+        # Path objects and walks parents in relative_to. Like identity(), the
+        # result depends only on ``source_file`` and roots fixed in __init__.
+        source_file = item.get("source_file")
+        if not isinstance(source_file, str):
+            rebased = self._rebased_uncached(source_file)
+        elif source_file in self._rebase_cache:
+            rebased = self._rebase_cache[source_file]
+        else:
+            rebased = self._rebase_cache[source_file] = self._rebased_uncached(source_file)
+        if rebased is not None:
+            item["source_file"] = rebased
+
+    def _rebased_uncached(self, source_file: str | None) -> str | None:
+        """The rebased ``source_file`` of a preserved item, or None to keep it as is."""
+        identity = self.identity(source_file)
         if not identity:
-            return
+            return None
         identity_path = Path(identity)
         if not _is_relative_to(identity_path, self.watch_root):
-            normalized = self.normalize(item.get("source_file"))
-            if normalized:
-                item["source_file"] = normalized
-            return
+            return self.normalize(source_file) or None
         try:
-            item["source_file"] = identity_path.relative_to(self.project_root).as_posix()
+            return identity_path.relative_to(self.project_root).as_posix()
         except ValueError:
-            item["source_file"] = identity
+            return identity
 
 
 # A source_file that is a URL/virtual scheme (gdoc://, s3://, http://, ...) rather
@@ -1362,23 +1383,50 @@ def _node_community_map(graph_data: dict) -> dict[str, int]:
     return out
 
 
-def _canonical_graph_for_compare(graph_data: dict) -> dict:
-    canonical = dict(graph_data)
-    canonical.pop("built_at_commit", None)
-    # A missing "directed" key means the same thing as "directed": false
-    # everywhere else in the codebase (#2342's --no-cluster path only started
-    # writing the key once it began inheriting it from the existing graph).
-    # Normalise so an old graph.json without the key doesn't register as
-    # "changed" against a freshly-written candidate that now carries
-    # "directed": false explicitly.
-    canonical["directed"] = bool(canonical.get("directed", False))
-    for key in ("nodes", "links", "edges", "hyperedges"):
-        if key in canonical and isinstance(canonical[key], list):
-            canonical[key] = sorted(
-                canonical[key],
-                key=lambda item: json.dumps(item, sort_keys=True, ensure_ascii=False, default=str),
-            )
-    return canonical
+_GRAPH_ITEM_LIST_KEYS = ("nodes", "links", "edges", "hyperedges")
+
+
+def _same_graph_for_compare(left: dict, right: dict) -> bool:
+    """True when two graph payloads are equal up to item order and build metadata.
+
+    Each item list compares as the sorted JSON text of its items, so a graph
+    whose item counts differ is rejected before any item is serialised. The
+    whole payload is never dumped again: on a 50k-node graph that cost more
+    than the incremental extraction it guards.
+    """
+    def lists(graph_data: dict) -> dict:
+        return {
+            key: graph_data[key]
+            for key in _GRAPH_ITEM_LIST_KEYS
+            if isinstance(graph_data.get(key), list)
+        }
+
+    def rest(graph_data: dict, list_keys) -> str:
+        canonical = {k: v for k, v in graph_data.items() if k not in list_keys}
+        canonical.pop("built_at_commit", None)
+        # A missing "directed" key means the same thing as "directed": false
+        # everywhere else in the codebase (#2342's --no-cluster path only started
+        # writing the key once it began inheriting it from the existing graph).
+        # Normalise so an old graph.json without the key doesn't register as
+        # "changed" against a freshly-written candidate that now carries
+        # "directed": false explicitly.
+        canonical["directed"] = bool(canonical.get("directed", False))
+        return json.dumps(canonical, sort_keys=True, ensure_ascii=False)
+
+    def item_text(item) -> str:
+        return json.dumps(item, sort_keys=True, ensure_ascii=False, default=str)
+
+    left_lists, right_lists = lists(left), lists(right)
+    if left_lists.keys() != right_lists.keys() or any(
+        len(items) != len(right_lists[key]) for key, items in left_lists.items()
+    ):
+        return False
+    if rest(left, left_lists) != rest(right, right_lists):
+        return False
+    return all(
+        sorted(map(item_text, items)) == sorted(map(item_text, right_lists[key]))
+        for key, items in left_lists.items()
+    )
 
 
 def _canonical_topology_for_compare(graph_data: dict) -> dict:
@@ -2318,10 +2366,7 @@ def _rebuild_code(
                     )
                     return False
                 try:
-                    same_graph = (
-                        json.dumps(_canonical_graph_for_compare(existing_payload), sort_keys=True, ensure_ascii=False)
-                        == json.dumps(_canonical_graph_for_compare(candidate_graph_data), sort_keys=True, ensure_ascii=False)
-                    )
+                    same_graph = _same_graph_for_compare(existing_payload, candidate_graph_data)
                 except Exception:
                     same_graph = False
             same_graph = same_graph and not legacy_layout
@@ -2586,10 +2631,7 @@ def _rebuild_code(
                 )
                 return False
             try:
-                same_graph = (
-                    json.dumps(_canonical_graph_for_compare(existing_payload), sort_keys=True, ensure_ascii=False)
-                    == json.dumps(_canonical_graph_for_compare(candidate_graph_data), sort_keys=True, ensure_ascii=False)
-                )
+                same_graph = _same_graph_for_compare(existing_payload, candidate_graph_data)
             except Exception:
                 same_graph = False
         same_graph = same_graph and not legacy_layout

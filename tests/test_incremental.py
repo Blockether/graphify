@@ -509,3 +509,53 @@ def test_update_does_not_resurrect_a_dropped_cross_file_edge_via_context(tmp_pat
         and e.get("relation") in ("imports", "calls")
     ]
     assert not stale, f"dropped cross-file edge resurrected via context index: {stale}"
+
+
+def _graph_labels(root: Path) -> set[str]:
+    data = json.loads((root / "graphify-out" / "graph.json").read_text(encoding="utf-8"))
+    return {str(n.get("label")) for n in data["nodes"]}
+
+
+def test_update_changed_reextracts_only_the_named_files(tmp_path):
+    """`update --changed FILE` keeps the graph of every other file as it is."""
+    (tmp_path / "a.py").write_text("def alpha():\n    return 1\n")
+    (tmp_path / "b.py").write_text("def beta():\n    return 2\n")
+    assert _run(["update", ".", "--no-cluster"], tmp_path).returncode == 0
+    (tmp_path / "a.py").write_text("def alpha():\n    return 1\n\n\ndef gamma():\n    return 3\n")
+    (tmp_path / "b.py").write_text("def delta():\n    return 4\n")
+    done = _run(["update", ".", "--no-cluster", "--changed", "a.py"], tmp_path)
+    assert done.returncode == 0, done.stderr
+    labels = _graph_labels(tmp_path)
+    assert "gamma()" in labels
+    # b.py was not named, so its stored nodes stay until a later update.
+    assert "beta()" in labels and "delta()" not in labels
+    done = _run(["update", ".", "--no-cluster", "--changed=b.py"], tmp_path)
+    assert done.returncode == 0, done.stderr
+    labels = _graph_labels(tmp_path)
+    assert "delta()" in labels and "beta()" not in labels
+
+
+def test_update_changed_matches_a_full_update_and_evicts_deleted_files(tmp_path):
+    from graphify.watch import _same_graph_for_compare
+
+    (tmp_path / "a.py").write_text("from b import beta\n\ndef alpha():\n    return beta()\n")
+    (tmp_path / "b.py").write_text("def beta():\n    return 2\n")
+    (tmp_path / "c.py").write_text("def gone():\n    return 0\n")
+    assert _run(["update", ".", "--no-cluster"], tmp_path).returncode == 0
+    (tmp_path / "b.py").write_text("def beta():\n    return 2\n\n\ndef extra():\n    return 5\n")
+    (tmp_path / "c.py").unlink()
+    done = _run(["update", ".", "--no-cluster", "--changed", "b.py", "--changed", "c.py"], tmp_path)
+    assert done.returncode == 0, done.stderr
+    graph = tmp_path / "graphify-out" / "graph.json"
+    incremental = json.loads(graph.read_text(encoding="utf-8"))
+    assert "gone()" not in {n.get("label") for n in incremental["nodes"]}
+    assert _run(["update", ".", "--no-cluster", "--force"], tmp_path).returncode == 0
+    full = json.loads(graph.read_text(encoding="utf-8"))
+    assert _same_graph_for_compare(incremental, full)
+
+
+def test_update_changed_needs_a_path(tmp_path):
+    (tmp_path / "a.py").write_text("def alpha():\n    return 1\n")
+    done = _run(["update", ".", "--changed"], tmp_path)
+    assert done.returncode == 2
+    assert "--changed needs a file path" in done.stderr

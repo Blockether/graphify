@@ -9368,24 +9368,6 @@ def extract(
     elif cache_root is not None:
         root = cache_root
     root = root.resolve()
-    python_scan_paths = list(paths)
-    for context_node in resolution_context_nodes or []:
-        source_file = context_node.get("source_file")
-        if not source_file or Path(source_file).suffix.lower() != ".py":
-            continue
-        context_path = Path(source_file)
-        if not context_path.is_absolute():
-            context_path = root / context_path
-        if context_path.is_file():
-            python_scan_paths.append(context_path)
-    python_module_alias_files, scan_root_aliases = _python_absolute_import_alias_files(
-        python_scan_paths, root
-    )
-    ambiguous_python_modules = {
-        module_id
-        for module_id, module_paths in python_module_alias_files.items()
-        if len(module_paths) > 1 and module_id not in scan_root_aliases
-    }
 
     # Project-level extension->language declarations (#2961). detect() has
     # usually activated them for this root already; a direct library caller
@@ -9705,6 +9687,34 @@ def extract(
     # passes below (which rewrite node ids), so it can never go stale — see the
     # marker set in the per-file extractor. Populated just before the pass that uses it.
     callable_nids: set[str] = set()
+
+    # The absolute Python module map serves only Python import edges and the
+    # Python resolvers, which read only `.py` paths. An incremental update that
+    # re-extracts no Python file skips probing every Python file of the context.
+    python_module_alias_files: dict[str, set[str]] = {}
+    ambiguous_python_modules: set[str] = set()
+    if any(effective_suffix(p) == ".py" for p in paths) or any(
+        isinstance(e, dict) and (e.get("_python_import_module") or e.get("_python_import_marker_only"))
+        for e in all_edges
+    ):
+        python_scan_paths = list(paths)
+        for context_node in resolution_context_nodes or []:
+            source_file = context_node.get("source_file")
+            if not source_file or Path(source_file).suffix.lower() != ".py":
+                continue
+            context_path = Path(source_file)
+            if not context_path.is_absolute():
+                context_path = root / context_path
+            if context_path.is_file():
+                python_scan_paths.append(context_path)
+        python_module_alias_files, scan_root_aliases = _python_absolute_import_alias_files(
+            python_scan_paths, root
+        )
+        ambiguous_python_modules = {
+            module_id
+            for module_id, module_paths in python_module_alias_files.items()
+            if len(module_paths) > 1 and module_id not in scan_root_aliases
+        }
 
     _suppress_ambiguous_python_imports(
         all_edges, all_nodes, all_raw_calls, ambiguous_python_modules,

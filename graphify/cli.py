@@ -2802,12 +2802,23 @@ def dispatch_command(cmd: str) -> None:
         no_cluster = False
         args = sys.argv[2:]
         watch_arg: str | None = None
-        for a in args:
+        # --changed FILE (repeatable): re-extract only these files, as the git
+        # hooks do; a path that no longer exists is evicted from the graph.
+        changed: list[Path] | None = None
+        args_iter = iter(args)
+        for a in args_iter:
             if a == "--force":
                 force = True
                 continue
             if a == "--no-cluster":
                 no_cluster = True
+                continue
+            if a == "--changed" or a.startswith("--changed="):
+                value = a.partition("=")[2] if "=" in a else next(args_iter, None)
+                if not value:
+                    print("error: --changed needs a file path", file=sys.stderr)
+                    sys.exit(2)
+                changed = (changed or []) + [Path(value)]
                 continue
             if a.startswith("-"):
                 print(f"error: unknown update option: {a}", file=sys.stderr)
@@ -2839,7 +2850,9 @@ def dispatch_command(cmd: str) -> None:
         # Interactive CLI: block on the per-repo lock rather than skip, so the
         # user sees their explicit `graphify update` complete instead of
         # exiting silently when a hook-driven rebuild happens to be running.
-        ok = _rebuild_code(watch_path, force=force, no_cluster=no_cluster, block_on_lock=True)
+        ok = _rebuild_code(
+            watch_path, changed_paths=changed, force=force, no_cluster=no_cluster, block_on_lock=True
+        )
         if ok:
             print("Code graph updated. For doc/paper/image changes run /graphify --update in your AI assistant.")
             if not (

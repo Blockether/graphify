@@ -49,6 +49,10 @@ class DomainPlugin:
     name: str = "plugin"
     description: str = ""
     kinds: dict[str, KindSpec] = {}
+    # Byte regexes of which every file that :meth:`detect` accepts matches one.
+    # When no file of the corpus matches any of them, the plugin cannot apply
+    # and the corpus is never parsed. Empty means detect needs the parsed corpus.
+    markers: tuple[bytes, ...] = ()
 
     def detect(self, corpus) -> bool:  # noqa: ARG002 - part of the contract
         return True

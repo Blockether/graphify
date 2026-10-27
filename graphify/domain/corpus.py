@@ -182,16 +182,21 @@ class Corpus:
                     self._index(form, sf)
         return self._definitions
 
+    @staticmethod
+    def candidates(root: Path, paths: Iterable[str | Path] | None = None) -> list[Path]:
+        """The Clojure files in ``paths``, or every Clojure file under ``root``, sorted."""
+        if paths is None:
+            found = list(iter_clojure_files(root))
+        else:
+            found = [Path(p) if Path(p).is_absolute() else root / p for p in paths]
+            found = [p for p in found if str(p).endswith(CLOJURE_SOURCE_SUFFIXES)]
+        return sorted(set(found))
+
     @classmethod
     def load(cls, root: str | Path, paths: Iterable[str | Path] | None = None) -> "Corpus":
         """Read the Clojure files in ``paths``, or every Clojure file under ``root``."""
         root = Path(root)
-        if paths is None:
-            candidates = list(iter_clojure_files(root))
-        else:
-            candidates = [Path(p) if Path(p).is_absolute() else root / p for p in paths]
-            candidates = [p for p in candidates if str(p).endswith(CLOJURE_SOURCE_SUFFIXES)]
-        return cls(root, [read_file(p, root) for p in sorted(set(candidates))])
+        return cls(root, [read_file(p, root) for p in cls.candidates(root, paths)])
 
     def _index(self, form: Form, sf: SourceFile) -> None:
         head = form.head if form.kind == edn.LIST else None

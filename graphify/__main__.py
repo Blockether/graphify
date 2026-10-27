@@ -901,6 +901,8 @@ def _run_cli() -> None:
         print("                            (also: GRAPHIFY_FORCE=1 env var; use after refactors that delete code)")
         print("    --no-cluster            skip clustering, write raw extraction only")
         print("                            (domain plugins add commands, queries and events; GRAPHIFY_DOMAIN=0 skips them)")
+        print("    --changed <file>        re-extract only this file, keep the rest of graph.json (repeatable;")
+        print("                            a path that no longer exists is removed from the graph)")
         print("  domain <path>           extract the domain model (commands, queries, events, schemas) with plugins")
         print("    --plugin <spec>         plugin name, module:attr or .py file (repeatable; default: auto-detect)")
         print("    --out <dir>             output directory (default <path>/graphify-out/domain)")
